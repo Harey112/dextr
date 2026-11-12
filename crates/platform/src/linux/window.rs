@@ -23,7 +23,17 @@ pub(crate) async fn shareable_windows() -> anyhow::Result<Option<Vec<ShareableWi
     Ok(None)
 }
 
-pub(crate) async fn capture_window(_id: Option<u64>) -> anyhow::Result<WindowCapture> {
+pub(crate) async fn place_own_window(title: &str, x: f32, y: f32) -> bool {
+    match super::kwin::move_window(title, x, y).await {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::info!("can't place the window: {e:#}");
+            false
+        }
+    }
+}
+
+pub(crate) async fn capture_window(_id: Option<u64>, _park: bool) -> anyhow::Result<WindowCapture> {
     let (ready_tx, ready_rx) = oneshot::channel();
     spawn_backend_thread("dextr-window", move || run(ready_tx))?;
     ready_rx.await.context("the window capture thread exited")?
@@ -140,7 +150,7 @@ async fn run(ready: oneshot::Sender<anyhow::Result<WindowCapture>>) {
 
     let (stop_tx, mut stop) = oneshot::channel();
     let (ended_tx, ended) = oneshot::channel();
-    let _ = ready.send(Ok(WindowCapture { title, app, frames, geometry: geometry_rx, ended, stop: Some(stop_tx) }));
+    let _ = ready.send(Ok(WindowCapture::with_stop(title, app, frames, geometry_rx, ended, stop_tx, Default::default())));
 
     let reason = loop {
         tokio::select! {

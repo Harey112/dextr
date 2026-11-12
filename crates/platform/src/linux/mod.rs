@@ -19,7 +19,7 @@ mod window;
 
 pub(crate) use capture::spawn_capture;
 pub(crate) use inject::spawn_injector;
-pub(crate) use window::{capture_window, shareable_windows};
+pub(crate) use window::{capture_window, place_own_window, shareable_windows};
 
 /// CLOCK_MONOTONIC in microseconds, the timestamp libei expects.
 fn now_us() -> u64 {

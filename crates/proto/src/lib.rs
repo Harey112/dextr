@@ -16,7 +16,7 @@ pub use keys::Key;
 use serde::{Deserialize, Serialize};
 
 /// Bumped on every incompatible change to [`Message`].
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// ALPN identifier negotiated on the QUIC connection.
 pub const ALPN: &[u8] = b"dextr/1";
@@ -139,6 +139,9 @@ pub struct WindowInfo {
     pub height: u32,
     /// The sender's pixels per logical unit (2 on a Retina Mac).
     pub scale: f32,
+    /// The window was dragged across: the pointer holds it at this point
+    /// (window pixels from its top-left), so place it under the pointer.
+    pub grab: Option<(f32, f32)>,
 }
 
 /// Messages on a window's unidirectional stream.

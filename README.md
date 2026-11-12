@@ -18,7 +18,8 @@ Share one mouse and keyboard between computers, in any direction, written in Rus
 | Control the peer (capture) | ✅ InputCapture portal + libei | 🧪 Quartz event tap | ⏳ Raw Input + hook |
 | Be controlled (inject) | ✅ RemoteDesktop portal + libei | 🧪 CGEventPost | ⏳ SendInput |
 | Launch at login | ✅ autostart entry | 🧪 LaunchAgent | ⏳ |
-| Share a window (send) | ✅ ScreenCast portal + PipeWire; input on KDE Plasma | 🧪 Quartz window capture | ⏳ |
+| Share a window (send) | ✅ ScreenCast portal + PipeWire; input on KDE Plasma | 🧪 ScreenCaptureKit | ⏳ |
+| Drag a window across the edge | ⏳ | 🧪 sends the window, parks the original | ⏳ |
 | Show a shared window (receive) | ✅ | ✅ (same iced code) | ⏳ |
 
 ✅ works · 🧪 written, compiles for macOS, not yet tested on a Mac · ⏳ not started
@@ -104,9 +105,25 @@ title bar and taskbar entry. Mouse, scrolling and keyboard in it go back to the 
   changes, frames are skipped, never queued, so it never lags behind.
 * **Linux:** no extra packages are needed (PipeWire is loaded at runtime). On KDE Plasma, a small KWin
   script tells dextr where the window is, so input reaches it; on other desktops it's view-only.
-* **macOS:** needs **Screen Recording** permission (System Settings → Privacy & Security).
+* **macOS:** captured with ScreenCaptureKit (macOS 12.3+), which keeps capturing a window even when
+  it's covered or off-screen. Needs **Screen Recording** permission (System Settings → Privacy &
+  Security); macOS asks again about once a month.
 
-The shared window stays on its own device too. Dragging a window across the edge isn't supported yet.
+### Dragging a window across (from a Mac)
+
+Drag a Mac window past the shared edge. The pointer moves to the other device and the window comes
+with it, opening under the pointer at the spot you were holding. On the Mac, the real window is moved
+out of sight (to the bottom-right corner) and keeps being captured there with ScreenCaptureKit. When
+you click or type in it from the other device, it comes back on the Mac for a moment so the input
+lands, then hides again. Close it on the other device (or press **Stop** on the Mac) and it returns to
+where it was.
+
+* Needs **Accessibility** (to move the window) and **Screen Recording** (to capture it).
+* macOS 15+ tiles windows dragged to the left or right edge. If that gets in the way, turn off
+  **Tile by dragging windows to screen edges** in System Settings › Desktop & Dock.
+* Dragging from Linux to the Mac isn't supported yet; share Linux windows with **Choose a window…**.
+
+Windows shared with **Choose a window…** stay on their own device too.
 
 ## How hand-off works
 

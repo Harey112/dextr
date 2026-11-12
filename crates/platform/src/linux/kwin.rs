@@ -120,3 +120,45 @@ impl KWinWatch {
         let _ = std::fs::remove_file(&self.path);
     }
 }
+
+/// Moves the window titled `caption` so its content's top-left (inside the
+/// title bar) is at (x, y), with a one-shot KWin script.
+pub async fn move_window(caption: &str, x: f32, y: f32) -> anyhow::Result<()> {
+    let conn = zbus::Connection::session().await.context("D-Bus session bus")?;
+    let pid = std::process::id();
+    let n = SCRIPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let plugin = format!("dextr-place-{pid}-{n}");
+    let dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    let path = dir.join(format!("{plugin}.js"));
+    // Rust's escaped form (\", \\, \n, \u{..}) is a valid JavaScript string.
+    let quoted = format!("{caption:?}");
+    let script = format!(
+        r#"for (const w of workspace.windowList()) {{
+    if (w.caption === {quoted}) {{
+        // Place the content, not the frame: offset by the title bar.
+        const g = w.frameGeometry, c = w.clientGeometry;
+        w.frameGeometry = {{ x: {x} - (c.x - g.x), y: {y} - (c.y - g.y), width: g.width, height: g.height }};
+    }}
+}}"#
+    );
+    std::fs::write(&path, script)?;
+    let result = async {
+        let id: i32 = conn
+            .call_method(Some(KWIN), "/Scripting", Some("org.kde.kwin.Scripting"), "loadScript", &(path.to_string_lossy().as_ref(), plugin.as_str()))
+            .await
+            .context("KWin scripting is unavailable (not KDE Plasma?)")?
+            .body()
+            .deserialize()?;
+        anyhow::ensure!(id >= 0, "KWin refused the script");
+        conn.call_method(Some(KWIN), format!("/Scripting/Script{id}").as_str(), Some("org.kde.kwin.Script"), "run", &())
+            .await?;
+        anyhow::Ok(())
+    }
+    .await;
+    // The script runs synchronously; unload it right after.
+    let _ = conn.call_method(Some(KWIN), "/Scripting", Some("org.kde.kwin.Scripting"), "unloadScript", &(plugin.as_str(),)).await;
+    let _ = std::fs::remove_file(&path);
+    result
+}
+
+static SCRIPTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);

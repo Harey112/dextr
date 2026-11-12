@@ -17,5 +17,5 @@ mod tls;
 
 pub use config::Config;
 pub use discovery::LocalAddress;
-pub use dextr_platform::window::ShareableWindow;
+pub use dextr_platform::window::{ShareableWindow, place_own_window};
 pub use engine::{Command, Event, Mode, Nearby, PairingState, SharedWindow, spawn};

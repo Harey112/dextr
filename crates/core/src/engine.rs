@@ -157,7 +157,8 @@ pub enum Event {
     /// Why a window couldn't be shared.
     ShareFailed(String),
     /// The other device shares a window: show it.
-    WindowOpened { info: WindowInfo, from: String, surface: Arc<Surface> },
+    /// `pointer` is where our pointer is (for a window dragged across).
+    WindowOpened { info: WindowInfo, from: String, surface: Arc<Surface>, pointer: Option<(f32, f32)> },
     /// New pixels for a shared window.
     WindowFrame { id: u32 },
     /// A shared window changed size.
@@ -203,7 +204,8 @@ enum Internal {
     PairPeerAccepted { id: u64 },
     PairEnded { id: u64, reason: String },
     Paired { id: u64, est: Established },
-    ShareReady(anyhow::Result<WindowCapture>),
+    /// A window capture started; `grab` if it was dragged across.
+    ShareReady { result: anyhow::Result<WindowCapture>, grab: Option<(f32, f32)> },
     ShareOpened { session: u64, info: WindowInfo },
     ShareEnded { id: u32, reason: String },
     WindowFrame { session: u64, id: u32, resized: bool },
@@ -251,6 +253,8 @@ struct Share {
     title: String,
     app: String,
     geometry: watch::Receiver<Option<WindowGeometry>>,
+    /// Brings a parked window back before input is injected.
+    input: dextr_platform::window::InputHandle,
     /// The latest frame size, in pixels.
     size: Arc<std::sync::Mutex<(u32, u32)>>,
     task: tokio::task::JoinHandle<()>,
@@ -293,6 +297,11 @@ struct Engine {
     connecting: bool,
     /// Pointer is pushing against the edge, waiting for the switch delay.
     pending_switch: Option<PendingSwitch>,
+    /// A window was dragged across: the user's eventual button release
+    /// belongs to the drag that already ended here, so don't send it.
+    swallow_release: bool,
+    /// Where the other device last put our pointer while controlling us.
+    pointer_here: (f32, f32),
     pairing: Option<Pairing>,
     next_pairing: u64,
     nearby: HashMap<Fingerprint, (Nearby, Instant)>,
@@ -395,6 +404,8 @@ async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: mpsc::Unbou
         reconnect_delay: RECONNECT_MIN,
         connecting: false,
         pending_switch: None,
+        swallow_release: false,
+        pointer_here: (0.0, 0.0),
         pairing: None,
         next_pairing: 0,
         nearby: HashMap::new(),
@@ -681,11 +692,13 @@ async fn pair_conversation(link: PairLink, mut decisions: mpsc::UnboundedReceive
 /// Sends one window: waits for its first frame, announces it, then streams
 /// changed tiles, always encoding the newest frame so a slow network skips
 /// frames instead of falling behind.
+#[allow(clippy::too_many_arguments)]
 async fn stream_window(
     conn: quinn::Connection,
     session: u64,
     id: u32,
     mut capture: WindowCapture,
+    grab: Option<(f32, f32)>,
     size: Arc<std::sync::Mutex<(u32, u32)>>,
     min_interval: Duration,
     tx: mpsc::UnboundedSender<Internal>,
@@ -701,7 +714,8 @@ async fn stream_window(
             }
         };
         let scale = capture.geometry.borrow().map_or(1.0, |g| first.width as f32 / g.width.max(1.0));
-        let info = WindowInfo { id, title: capture.title.clone(), app: capture.app.clone(), width: first.width, height: first.height, scale };
+        let grab = grab.map(|(x, y)| (x * scale, y * scale));
+        let info = WindowInfo { id, title: capture.title.clone(), app: capture.app.clone(), width: first.width, height: first.height, scale, grab };
         let _ = tx.send(Internal::ShareOpened { session, info });
 
         let mut out = conn.open_uni().await?;
@@ -1037,12 +1051,15 @@ impl Engine {
                     return;
                 }
                 let tx = self.internal.clone();
-                if std::env::var_os("DEXTR_TEST_WINDOW").is_some() {
-                    let _ = tx.send(Internal::ShareReady(Ok(test_pattern())));
+                if let Some(test) = std::env::var_os("DEXTR_TEST_WINDOW") {
+                    // "drag" pretends the window was dragged across, held at (100, 20).
+                    let grab = (test == "drag").then_some((100.0, 20.0));
+                    let _ = tx.send(Internal::ShareReady { result: Ok(test_pattern()), grab });
                     return;
                 }
                 tokio::spawn(async move {
-                    let _ = tx.send(Internal::ShareReady(capture_window::capture_window(window).await));
+                    let result = capture_window::capture_window(window, false).await;
+                    let _ = tx.send(Internal::ShareReady { result, grab: None });
                 });
             }
             Command::StopSharing(id) => self.stop_sharing(id, true),
@@ -1152,8 +1169,8 @@ impl Engine {
                 self.refresh_nearby();
                 self.start_session(est);
             }
-            Internal::ShareReady(Ok(capture)) => self.start_share(capture),
-            Internal::ShareReady(Err(e)) => {
+            Internal::ShareReady { result: Ok(capture), grab } => self.start_share(capture, grab),
+            Internal::ShareReady { result: Err(e), .. } => {
                 let reason = format!("{e:#}");
                 self.log(format!("Window sharing: {reason}"));
                 let _ = self.events.send(Event::ShareFailed(reason));
@@ -1370,12 +1387,13 @@ impl Engine {
 
     // ── Window sharing ──────────────────────────────────────────────────
 
-    fn start_share(&mut self, capture: WindowCapture) {
+    fn start_share(&mut self, capture: WindowCapture, grab: Option<(f32, f32)>) {
         let Some(session) = &self.session else { return };
         self.next_share += 1;
         let id = self.next_share;
         let size = Arc::new(std::sync::Mutex::new((0, 0)));
         let geometry = capture.geometry.clone();
+        let input = capture.input_handle();
         let (title, app) = (capture.title.clone(), capture.app.clone());
         let min_interval = match self.config.windows.frame_rate {
             FrameRate::Match => Duration::ZERO,
@@ -1388,6 +1406,7 @@ impl Engine {
             session.id,
             id,
             capture,
+            grab,
             size.clone(),
             min_interval,
             self.internal.clone(),
@@ -1395,7 +1414,7 @@ impl Engine {
         if geometry.borrow().is_none() {
             self.log(format!("“{title}” is shared view-only: dextr can't tell where it is on screen (this needs KDE Plasma)."));
         }
-        self.shares.insert(id, Share { title, app, geometry, size, task });
+        self.shares.insert(id, Share { title, app, geometry, input, size, task });
         self.publish_shares();
     }
 
@@ -1430,7 +1449,13 @@ impl Engine {
         let surface = self.surfaces.lock().unwrap().entry(info.id).or_default().clone();
         let from = self.session.as_ref().map(|s| s.peer.name.clone()).unwrap_or_default();
         self.incoming.insert(info.id, info.clone());
-        let _ = self.events.send(Event::WindowOpened { info, from, surface });
+        // Dragged across while the sender controls us: it goes under the pointer.
+        let pointer = (info.grab.is_some() && self.mode == Mode::Controlled).then_some(self.pointer_here);
+        let pointer = pointer.or_else(|| {
+            // Test mode: no input, so use a fixed spot.
+            (info.grab.is_some() && std::env::var_os("DEXTR_TEST_NO_INPUT").is_some()).then_some((500.0, 300.0))
+        });
+        let _ = self.events.send(Event::WindowOpened { info, from, surface, pointer });
     }
 
     /// The other device stopped sharing a window.
@@ -1445,6 +1470,7 @@ impl Engine {
     /// the real window.
     fn window_input(&mut self, id: u32, input: Input) {
         let Some(share) = self.shares.get(&id) else { return };
+        share.input.prepare();
         let Some(g) = *share.geometry.borrow() else { return };
         let (fw, fh) = *share.size.lock().unwrap();
         if fw == 0 || fh == 0 {
@@ -1594,7 +1620,7 @@ impl Engine {
         self.session = Some(Session { id, dialed, conn, out: out_tx, peer });
         // Whichever device was arranged last wins.
         self.send_arrangement();
-        if std::env::var_os("DEXTR_TEST_WINDOW").is_some_and(|v| v == "share") {
+        if std::env::var_os("DEXTR_TEST_WINDOW").is_some_and(|v| v == "share" || v == "drag") {
             self.command(Command::ShareWindow(None));
         }
         self.sync_capture();
@@ -1630,6 +1656,7 @@ impl Engine {
         }
         self.set_mode(Mode::Local);
         self.sync_capture();
+        self.swallow_release = false;
         // Shared windows end with the connection, in both directions.
         for id in self.shares.keys().copied().collect::<Vec<_>>() {
             self.stop_sharing(id, false);
@@ -1651,6 +1678,7 @@ impl Engine {
         }
         match event {
             CaptureEvent::Activated { x, y } => self.activated(x, y),
+            CaptureEvent::DragOut { x, y, window, grab } => self.drag_out(x, y, window, grab),
             CaptureEvent::Input(input) if self.mode == Mode::Controlling => self.forward(input),
             CaptureEvent::Input(_) => {}
             CaptureEvent::Deactivated => {
@@ -1668,6 +1696,31 @@ impl Engine {
                 let _ = self.events.send(Event::CaptureReady(Err(reason)));
             }
         }
+    }
+
+    /// A window was dragged across the edge: the pointer goes to the peer and
+    /// the window comes along, parked out of sight here.
+    fn drag_out(&mut self, x: f32, y: f32, window: u64, grab: (f32, f32)) {
+        let ours = self.our_screens();
+        let entry = if self.paused { None } else { edge::entry_point(self.config.link(), x, y, &ours, self.peer_screens()) };
+        let Some(p) = entry.filter(|_| self.session.is_some()) else {
+            // Nowhere to go: give the pointer back.
+            let back = edge::inside_edge(self.config.peer_side, x, y, &ours).unwrap_or((x, y));
+            if let Some(c) = &self.capture {
+                c.release(back.0, back.1);
+            }
+            return;
+        };
+        self.enter_peer(p);
+        self.swallow_release = true;
+        if !self.config.windows.enabled {
+            return;
+        }
+        let tx = self.internal.clone();
+        tokio::spawn(async move {
+            let result = capture_window::capture_window(Some(window), true).await;
+            let _ = tx.send(Internal::ShareReady { result, grab: Some(grab) });
+        });
     }
 
     fn activated(&mut self, x: f32, y: f32) {
@@ -1743,7 +1796,7 @@ impl Engine {
                 }
             }
             CaptureEvent::Input(_) => self.cancel_switch(p),
-            CaptureEvent::Activated { .. } => self.pending_switch = Some(p),
+            CaptureEvent::Activated { .. } | CaptureEvent::DragOut { .. } => self.pending_switch = Some(p),
             CaptureEvent::Deactivated => {}
             CaptureEvent::Stopped { reason } => {
                 self.capture = None;
@@ -1767,6 +1820,7 @@ impl Engine {
                     self.send_motion(self.pointer.0, self.pointer.1);
                 }
             }
+            Captured::Button { button: Button::Left, pressed: false } if std::mem::take(&mut self.swallow_release) => {}
             Captured::Button { button, pressed } => {
                 let button = match (self.config.mouse.swap_buttons, button) {
                     (true, Button::Left) => Button::Right,
@@ -1844,6 +1898,7 @@ impl Engine {
                 }
                 self.set_mode(Mode::Controlled);
                 self.sync_capture();
+                self.pointer_here = (x, y);
                 if let Some(i) = &self.injector {
                     i.inject(Input::Motion { x, y });
                 } else {
@@ -1851,6 +1906,9 @@ impl Engine {
                 }
             }
             Message::Input(input) => {
+                if let Input::Motion { x, y } | Input::Button { x, y, .. } = input {
+                    self.pointer_here = (x, y);
+                }
                 if self.mode == Mode::Controlled
                     && let Some(i) = &self.injector
                 {
@@ -1991,12 +2049,14 @@ mod tests {
         let (tx_b, mut rx_b) = mpsc::unbounded_channel();
         let (tx_a, mut rx_a) = mpsc::unbounded_channel();
         let size = Arc::new(std::sync::Mutex::new((0, 0)));
-        tokio::spawn(stream_window(at_b.conn.clone(), 1, 7, capture, size.clone(), Duration::ZERO, tx_b));
+        tokio::spawn(stream_window(at_b.conn.clone(), 1, 7, capture, Some((10.0, 5.0)), size.clone(), Duration::ZERO, tx_b));
         let surfaces: Surfaces = Arc::default();
         tokio::spawn(receive_windows(at_a.conn.clone(), 1, surfaces.clone(), tx_a));
 
         let Some(Internal::ShareOpened { info, .. }) = rx_b.recv().await else { panic!("not announced") };
         assert_eq!((info.id, info.width, info.height, info.scale, info.title.as_str()), (7, 64, 40, 2.0, "Notes"));
+        // Held 10×5 points from its corner on a 2× display: 20×10 pixels.
+        assert_eq!(info.grab, Some((20.0, 10.0)));
         let Some(Internal::WindowFrame { id: 7, resized: true, .. }) = rx_a.recv().await else { panic!("no frame") };
         let surface = surfaces.lock().unwrap().get(&7).cloned().unwrap();
         assert_eq!(surface.lock().pixels, pixels);

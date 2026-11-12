@@ -867,7 +867,8 @@ fn windows(app: &App) -> Element<'_, Message> {
         "Good to know",
         column![
             muted("On Linux, the desktop asks which window to share each time. On KDE Plasma, dextr also finds the window on screen, so clicks and typing from the other device reach it; elsewhere it's shared view-only.").size(12),
-            muted("Dragging a window across the shared edge to send it isn't supported yet.").size(12),
+            muted("From a Mac: drag a window past the shared edge to send it across. It opens under the pointer on the other device and hides on the Mac; close it there to bring it back. Turn off “Tile by dragging windows to screen edges” (System Settings › Desktop & Dock) if macOS snaps it instead.").size(12),
+            muted("Dragging from Linux to the Mac isn't supported yet: use Choose a window….").size(12),
         ]
         .spacing(6),
     ))

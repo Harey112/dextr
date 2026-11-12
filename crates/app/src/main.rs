@@ -635,22 +635,40 @@ impl App {
             Event::ShareableWindows(list) => self.shareable = list,
             Event::Sharing(list) => self.sharing = list,
             Event::ShareFailed(reason) => self.share_error = Some(reason),
-            Event::WindowOpened { info, from, surface } => {
+            Event::WindowOpened { info, from, surface, pointer } => {
+                // Dragged across: put the point the pointer holds under the pointer.
+                let place = pointer.zip(info.grab).map(|((px, py), (gx, gy))| (px - gx / self.scale, py - gy / self.scale));
                 let (window, open) = window::open(window::Settings {
                     size: self.exact_size(info.width, info.height),
                     resizable: false,
+                    position: match place {
+                        Some((x, y)) => window::Position::Specific(iced::Point::new(x, y)),
+                        None => window::Position::default(),
+                    },
                     ..Default::default()
                 });
+                let title = if from.is_empty() { info.title.clone() } else { format!("{} — {from}", info.title) };
                 tracing::info!("showing “{}” from {from}: {}×{} px at scale {}", info.title, info.width, info.height, self.scale);
                 self.push_log(format!("{from} shared “{}”.", info.title));
                 self.remotes.insert(window, Remote { id: info.id, title: info.title, from, surface });
+                // Wayland ignores the requested position; place it through the
+                // compositor once it's on screen.
+                let open = match place {
+                    Some((x, y)) => open.discard().chain(Task::future(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        if dextr_core::place_own_window(&title, x, y).await {
+                            tracing::info!("placed “{title}” at {x}, {y}");
+                        }
+                    }).discard()),
+                    None => open.discard(),
+                };
                 if std::env::var_os("DEXTR_TEST_SCREENSHOT").is_some() {
                     let shot = Task::future(tokio::time::sleep(std::time::Duration::from_secs(2)))
                         .then(move |()| window::screenshot(window))
                         .map(Message::Screenshot);
-                    return open.discard().chain(shot);
+                    return open.chain(shot);
                 }
-                return open.discard();
+                return open;
             }
             Event::WindowResized { id, width, height } => {
                 if let Some(w) = self.remote_window(id) {

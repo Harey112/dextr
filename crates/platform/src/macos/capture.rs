@@ -39,6 +39,17 @@ struct State {
     /// Our screens whose `side` edge is on the outside of the layout.
     edges: Vec<Rect>,
     cursor_hidden: bool,
+    /// The window under the pointer since the left button went down.
+    drag: Option<Drag>,
+}
+
+/// A possible window drag: the window under the pointer when the button
+/// went down and where it was.
+struct Drag {
+    window: u32,
+    origin: CGPoint,
+    /// The pointer relative to the window's top-left.
+    grab: (f64, f64),
 }
 
 impl State {
@@ -129,7 +140,7 @@ pub(crate) fn spawn_capture(
 ) -> anyhow::Result<()> {
     let mut known = screens();
     screens_tx.send_replace(known.clone());
-    let mut state = State { enabled: false, captured: false, armed: true, side, edges: Vec::new(), cursor_hidden: false };
+    let mut state = State { enabled: false, captured: false, armed: true, side, edges: Vec::new(), cursor_hidden: false, drag: None };
     state.set_layout(side, &known);
     let shared = Arc::new(Shared {
         events,
@@ -262,8 +273,27 @@ unsafe extern "C" fn callback(_proxy: CGEventTapProxy, kind: CGEventType, event:
     }
 
     if !st.captured {
-        // Only plain moves switch: crossing while dragging would leave the
-        // button held here.
+        match kind {
+            LEFT_DOWN => {
+                let p = unsafe { CGEventGetLocation(event) };
+                let id = unsafe { CGEventGetIntegerValueField(event, FIELD_WINDOW_UNDER_POINTER) } as u32;
+                let info = if id != 0 { super::window::window_info(id) } else { None };
+                st.drag = info.or_else(|| super::window::window_at(p)).filter(|w| w.is_app_window()).map(|w| {
+                    let o = w.origin();
+                    Drag { window: w.id, origin: o, grab: (p.x - o.x, p.y - o.y) }
+                });
+            }
+            LEFT_UP => st.drag = None,
+            LEFT_DRAGGED => {
+                if let Some(out) = drag_out(&mut st, event) {
+                    let _ = shared.events.send(out);
+                    return ptr::null_mut();
+                }
+            }
+            _ => {}
+        }
+        // Plain moves switch; crossing while dragging anything but a window
+        // would leave the button held here.
         if kind == MOUSE_MOVED {
             let (p, dx, dy) = unsafe {
                 (
@@ -291,6 +321,48 @@ unsafe extern "C" fn callback(_proxy: CGEventTapProxy, kind: CGEventType, event:
     };
     unsafe { translate(kind, event, send) };
     ptr::null_mut()
+}
+
+/// A window being dragged past the edge facing the peer: take over the
+/// pointer, end the drag here, and report which window goes along.
+fn drag_out(st: &mut State, event: CGEventRef) -> Option<CaptureEvent> {
+    let (p, dx, dy) = unsafe {
+        (
+            CGEventGetLocation(event),
+            CGEventGetDoubleValueField(event, FIELD_DELTA_X),
+            CGEventGetDoubleValueField(event, FIELD_DELTA_Y),
+        )
+    };
+    let drag = st.drag.as_ref()?;
+    if !st.armed || !st.pushing_edge(p, dx, dy) {
+        return None;
+    }
+    // Only if the window itself is moving (not selecting text, say).
+    let now = super::window::window_info(drag.window)?.origin();
+    if (now.x - drag.origin.x).abs() < 1.0 && (now.y - drag.origin.y).abs() < 1.0 {
+        return None;
+    }
+    let (window, grab) = (drag.window, drag.grab);
+    st.drag = None;
+    st.grab();
+    // End the drag on this Mac a little away from the edge, so macOS doesn't
+    // tile the window into half the screen.
+    let inward = 60.0;
+    let at = match st.side {
+        Side::Right => CGPoint { x: p.x - inward, y: p.y },
+        Side::Left => CGPoint { x: p.x + inward, y: p.y },
+        Side::Bottom => CGPoint { x: p.x, y: p.y - inward },
+        Side::Top => CGPoint { x: p.x, y: p.y + inward },
+    };
+    unsafe {
+        let up = CGEventCreateMouseEvent(ptr::null_mut(), LEFT_UP, at, 0);
+        if !up.is_null() {
+            CGEventSetIntegerValueField(up, FIELD_SOURCE_USER_DATA, DEXTR_EVENT);
+            CGEventPost(HID_EVENT_TAP, up);
+            CFRelease(up);
+        }
+    }
+    Some(CaptureEvent::DragOut { x: p.x as f32, y: p.y as f32, window: window as u64, grab: (grab.0 as f32, grab.1 as f32) })
 }
 
 unsafe fn translate(kind: CGEventType, event: CGEventRef, send: impl Fn(Captured)) {

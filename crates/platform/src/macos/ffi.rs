@@ -68,6 +68,8 @@ pub const FIELD_KEYCODE: u32 = 9;
 pub const FIELD_SCROLL_DELTA_1: u32 = 11;
 pub const FIELD_SCROLL_DELTA_2: u32 = 12;
 pub const FIELD_SOURCE_PID: u32 = 41;
+/// The window under the pointer that will handle a mouse event.
+pub const FIELD_WINDOW_UNDER_POINTER: u32 = 92;
 pub const FIELD_SOURCE_USER_DATA: u32 = 42;
 pub const FIELD_SCROLL_CONTINUOUS: u32 = 88;
 pub const FIELD_SCROLL_POINT_DELTA_1: u32 = 96;
@@ -216,6 +218,32 @@ unsafe extern "C" {
     pub fn CFRunLoopStop(rl: CFRunLoopRef);
     pub fn CFRelease(cf: CFTypeRef);
     pub fn CFStringCreateWithCString(alloc: *const c_void, s: *const c_char, encoding: u32) -> CFStringRef;
+}
+
+// ── Accessibility (moving other apps' windows) ──────────────────────────
+
+pub type AXUIElementRef = *const c_void;
+pub const AX_VALUE_CGPOINT: u32 = 1;
+
+#[link(name = "ApplicationServices", kind = "framework")]
+unsafe extern "C" {
+    pub fn AXUIElementCreateApplication(pid: i32) -> AXUIElementRef;
+    pub fn AXUIElementCopyAttributeValue(element: AXUIElementRef, attribute: CFStringRef, value: *mut CFTypeRef) -> i32;
+    pub fn AXUIElementSetAttributeValue(element: AXUIElementRef, attribute: CFStringRef, value: CFTypeRef) -> i32;
+    /// Private but used by every window manager: the CGWindowID of a window.
+    pub fn _AXUIElementGetWindow(element: AXUIElementRef, id: *mut u32) -> i32;
+    pub fn AXValueCreate(kind: u32, value: *const c_void) -> CFTypeRef;
+    pub fn AXValueGetValue(value: CFTypeRef, kind: u32, out: *mut c_void) -> bool;
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    pub fn CFRetain(cf: CFTypeRef) -> CFTypeRef;
+}
+
+/// A CFString for `s`; release it with `CFRelease`.
+pub fn cfstr(s: &std::ffi::CStr) -> CFStringRef {
+    unsafe { CFStringCreateWithCString(std::ptr::null(), s.as_ptr(), STRING_ENCODING_UTF8) }
 }
 
 /// Allows hiding the cursor while dextr isn't the frontmost app.

@@ -19,3 +19,11 @@ reis.workspace = true
 rustix = { version = "1", features = ["time"] }
 libloading = "0.8"
 zbus = { version = "6", default-features = false, features = ["tokio", "service", "proxy"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-screen-capture-kit = "0.3"
+objc2-core-media = "0.3"
+objc2-core-video = "0.3"
+block2 = "0.6"

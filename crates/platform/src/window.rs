@@ -46,6 +46,27 @@ pub struct WindowCapture {
     /// Why the capture ended (the window closed, the user stopped it…).
     pub ended: oneshot::Receiver<String>,
     pub(crate) stop: Option<oneshot::Sender<()>>,
+    pub(crate) input: InputHandle,
+}
+
+/// Prepares a shared window for input from the other device. A window
+/// parked out of sight is brought back for a moment first, so injected
+/// clicks land on it; it's parked again once input stops.
+#[derive(Clone, Default)]
+pub struct InputHandle(Option<Arc<dyn Fn() + Send + Sync>>);
+
+impl InputHandle {
+    #[allow(dead_code)] // used by the macOS backend
+    pub(crate) fn new(f: impl Fn() + Send + Sync + 'static) -> Self {
+        Self(Some(Arc::new(f)))
+    }
+
+    /// Call before injecting input; updates the geometry right away.
+    pub fn prepare(&self) {
+        if let Some(f) = &self.0 {
+            f();
+        }
+    }
 }
 
 impl WindowCapture {
@@ -57,7 +78,11 @@ impl WindowCapture {
         geometry: watch::Receiver<Option<WindowGeometry>>,
         ended: oneshot::Receiver<String>,
     ) -> Self {
-        Self { title, app, frames, geometry, ended, stop: None }
+        Self { title, app, frames, geometry, ended, stop: None, input: InputHandle::default() }
+    }
+
+    pub fn input_handle(&self) -> InputHandle {
+        self.input.clone()
     }
 
     #[allow(dead_code)]
@@ -68,8 +93,9 @@ impl WindowCapture {
         geometry: watch::Receiver<Option<WindowGeometry>>,
         ended: oneshot::Receiver<String>,
         stop: oneshot::Sender<()>,
+        input: InputHandle,
     ) -> Self {
-        Self { title, app, frames, geometry, ended, stop: Some(stop) }
+        Self { title, app, frames, geometry, ended, stop: Some(stop), input }
     }
 }
 
@@ -88,7 +114,16 @@ pub async fn shareable_windows() -> anyhow::Result<Option<Vec<ShareableWindow>>>
 }
 
 /// Starts capturing window `id` from [`shareable_windows`], or lets the user
-/// pick one in the OS's dialog when `id` is `None`.
-pub async fn capture_window(id: Option<u64>) -> anyhow::Result<WindowCapture> {
-    crate::native::capture_window(id).await
+/// pick one in the OS's dialog when `id` is `None`. With `park`, the real
+/// window is moved out of sight while shared (it was dragged to the other
+/// device) and put back when sharing stops.
+pub async fn capture_window(id: Option<u64>, park: bool) -> anyhow::Result<WindowCapture> {
+    crate::native::capture_window(id, park).await
+}
+
+/// Moves one of dextr's own windows (a window shared by the other device)
+/// so its content's top-left is at (x, y), where the OS doesn't let apps place their
+/// windows themselves (Wayland). Returns false if it can't.
+pub async fn place_own_window(title: &str, x: f32, y: f32) -> bool {
+    crate::native::place_own_window(title, x, y).await
 }
