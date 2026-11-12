@@ -1,0 +1,18 @@
+[package]
+name = "dextr-app"
+description = "dextr desktop app (iced)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dextr"
+path = "src/main.rs"
+
+[dependencies]
+dextr-proto.workspace = true
+dextr-core.workspace = true
+iced.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio.workspace = true

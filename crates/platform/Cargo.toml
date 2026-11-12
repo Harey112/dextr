@@ -1,0 +1,19 @@
+[package]
+name = "dextr-platform"
+description = "OS backends: input capture and input injection"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dextr-proto.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+futures.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { workspace = true, features = ["input_capture", "remote_desktop", "screencast"] }
+reis.workspace = true
+rustix = { version = "1", features = ["time"] }
