@@ -31,3 +31,11 @@ pub(crate) fn spawn_injector(
     let _ = ready.send(Err(unsupported()));
     Ok(())
 }
+
+pub(crate) async fn shareable_windows() -> anyhow::Result<Option<Vec<crate::window::ShareableWindow>>> {
+    Err(anyhow::anyhow!("window sharing is not implemented on this OS yet"))
+}
+
+pub(crate) async fn capture_window(_id: Option<u64>) -> anyhow::Result<crate::window::WindowCapture> {
+    Err(anyhow::anyhow!("window sharing is not implemented on this OS yet"))
+}

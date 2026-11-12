@@ -17,3 +17,5 @@ futures.workspace = true
 ashpd = { workspace = true, features = ["input_capture", "remote_desktop", "screencast"] }
 reis.workspace = true
 rustix = { version = "1", features = ["time"] }
+libloading = "0.8"
+zbus = { version = "6", default-features = false, features = ["tokio", "service", "proxy"] }

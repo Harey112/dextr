@@ -16,9 +16,11 @@
 mod capture;
 mod ffi;
 mod inject;
+mod window;
 
 pub(crate) use capture::spawn_capture;
 pub(crate) use inject::spawn_injector;
+pub(crate) use window::{capture_window, shareable_windows};
 
 use dextr_proto::{Button, Rect};
 
@@ -75,3 +77,4 @@ fn button_from_number(n: i64) -> Button {
         n => Button::Other(n as u16),
     }
 }
+

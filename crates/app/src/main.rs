@@ -5,17 +5,23 @@
 
 mod arrangement;
 mod autostart;
+mod keymap;
 mod pages;
+mod remote_window;
 
-use std::collections::VecDeque;
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+};
 
 use dextr_core::{
-    Command, Config, Event, LocalAddress, Mode, Nearby, PairingState,
-    settings::{Appearance, Codec, FrameRate, ModifierMap, ReturnShortcut, StreamQuality},
+    Command, Config, Event, LocalAddress, Mode, Nearby, PairingState, ShareableWindow, SharedWindow,
+    window::Surface,
+    settings::{Appearance, FrameRate, ModifierMap, ReturnShortcut},
 };
-use dextr_proto::{Os, Rect};
+use dextr_proto::{Input, Os, Rect};
 use iced::{
-    Subscription, Task, Theme,
+    Size, Subscription, Task, Theme, window,
     futures::{SinkExt, Stream},
 };
 use tokio::sync::mpsc::UnboundedSender;
@@ -28,12 +34,21 @@ fn main() -> iced::Result {
         )
         .init();
 
-    iced::application(App::new, App::update, App::view)
+    // A daemon, so windows shared by the other device can be real windows
+    // of their own next to the main one.
+    iced::daemon(App::boot, App::update, App::view)
         .title(App::title)
         .theme(App::theme)
         .subscription(App::subscription)
-        .window_size((980.0, 680.0))
         .run()
+}
+
+/// A window shared by the other device, open here.
+pub struct Remote {
+    pub id: u32,
+    pub title: String,
+    pub from: String,
+    pub surface: Arc<Surface>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -128,6 +143,16 @@ pub struct App {
     pub addresses: Vec<LocalAddress>,
     /// The "pair by address" field.
     pub pair_address: String,
+    pub main_window: Option<window::Id>,
+    /// The main window's scale factor, used to size shared windows 1:1.
+    pub scale: f32,
+    /// Windows shared by the other device, by their window here.
+    pub remotes: HashMap<window::Id, Remote>,
+    /// Our windows being shared.
+    pub sharing: Vec<SharedWindow>,
+    /// Windows that can be shared without the OS picker (macOS).
+    pub shareable: Option<Vec<ShareableWindow>>,
+    pub share_error: Option<String>,
 }
 
 /// The editable copy of the settings.
@@ -195,12 +220,6 @@ pub enum Setting {
     Appearance(Appearance),
     WindowsEnabled(bool),
     WindowsAcceptIncoming(bool),
-    NativeFrames(bool),
-    MatchTheme(bool),
-    FollowAudio(bool),
-    ReturnOnDisconnect(bool),
-    Quality(StreamQuality),
-    Codec(Codec),
     FrameRate(FrameRate),
 }
 
@@ -234,12 +253,6 @@ impl Setting {
             Setting::Appearance(v) => c.appearance = v,
             Setting::WindowsEnabled(v) => c.windows.enabled = v,
             Setting::WindowsAcceptIncoming(v) => c.windows.accept_incoming = v,
-            Setting::NativeFrames(v) => c.windows.native_frames = v,
-            Setting::MatchTheme(v) => c.windows.match_theme = v,
-            Setting::FollowAudio(v) => c.windows.follow_audio = v,
-            Setting::ReturnOnDisconnect(v) => c.windows.return_on_disconnect = v,
-            Setting::Quality(v) => c.windows.quality = v,
-            Setting::Codec(v) => c.windows.codec = v,
             Setting::FrameRate(v) => c.windows.frame_rate = v,
         }
     }
@@ -253,6 +266,15 @@ pub enum Message {
     Name(String),
     Port(String),
     PairAddress(String),
+    MainOpened(window::Id),
+    Scale(f32),
+    WindowGone(window::Id),
+    RemoteInput(u32, Input),
+    ListWindows,
+    ShareWindow(Option<u64>),
+    StopSharing(u32),
+    /// Test only (`DEXTR_TEST_SCREENSHOT`): save a shared window's pixels.
+    Screenshot(window::Screenshot),
     PairWith(String),
     PairDecision(bool),
     Copy(String),
@@ -286,11 +308,16 @@ fn engine_events() -> impl Stream<Item = Message> {
 }
 
 impl App {
-    fn new() -> Self {
-        Self { launch_at_login: autostart::enabled(), ..Self::default() }
+    fn boot() -> (Self, Task<Message>) {
+        let (id, open) = window::open(window::Settings { size: Size::new(980.0, 680.0), ..Default::default() });
+        let app = Self { launch_at_login: autostart::enabled(), main_window: Some(id), scale: 1.0, ..Self::default() };
+        (app, open.map(Message::MainOpened))
     }
 
-    fn title(&self) -> String {
+    fn title(&self, window: window::Id) -> String {
+        if let Some(r) = self.remotes.get(&window) {
+            return if r.from.is_empty() { r.title.clone() } else { format!("{} — {}", r.title, r.from) };
+        }
         match (&self.peer, self.mode) {
             (Some(p), Some(Mode::Controlling)) => format!("dextr — controlling {}", p.name),
             (Some(p), _) => format!("dextr — connected to {}", p.name),
@@ -298,7 +325,7 @@ impl App {
         }
     }
 
-    fn theme(&self) -> Option<Theme> {
+    fn theme(&self, _window: window::Id) -> Option<Theme> {
         match self.form.config.appearance {
             Appearance::System => None,
             Appearance::Light => Some(Theme::Light),
@@ -307,7 +334,17 @@ impl App {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        Subscription::run(engine_events)
+        Subscription::batch([Subscription::run(engine_events), window::close_events().map(Message::WindowGone)])
+    }
+
+    /// The window here that shows the other device's window `id`.
+    fn remote_window(&self, id: u32) -> Option<window::Id> {
+        self.remotes.iter().find(|(_, r)| r.id == id).map(|(w, _)| *w)
+    }
+
+    /// Logical size that shows `w`×`h` pixels one-to-one.
+    fn exact_size(&self, w: u32, h: u32) -> Size {
+        Size::new(w as f32 / self.scale, h as f32 / self.scale)
     }
 
     fn push_log(&mut self, line: impl Into<String>) {
@@ -379,8 +416,39 @@ impl App {
         }
         match message {
             Message::EngineStarted(tx) => self.engine = Some(tx),
-            Message::Engine(event) => self.on_event(*event),
-            Message::Navigate(page) => self.page = page,
+            Message::Engine(event) => return self.on_event(*event),
+            Message::MainOpened(id) => return window::scale_factor(id).map(Message::Scale),
+            Message::Scale(scale) => self.scale = scale.max(0.5),
+            Message::WindowGone(id) => {
+                if Some(id) == self.main_window {
+                    return iced::exit();
+                }
+                if let Some(r) = self.remotes.remove(&id) {
+                    self.send(Command::CloseWindow(r.id));
+                }
+            }
+            Message::RemoteInput(id, input) => self.send(Command::WindowInput { id, input }),
+            Message::ListWindows => self.send(Command::ListWindows),
+            Message::ShareWindow(window) => {
+                self.share_error = None;
+                self.send(Command::ShareWindow(window));
+            }
+            Message::StopSharing(id) => self.send(Command::StopSharing(id)),
+            Message::Screenshot(shot) => {
+                // A plain PPM, so tests need no image library.
+                if let Some(path) = std::env::var_os("DEXTR_TEST_SCREENSHOT") {
+                    let mut ppm = format!("P6\n{} {}\n255\n", shot.size.width, shot.size.height).into_bytes();
+                    ppm.extend(shot.rgba.as_chunks::<4>().0.iter().flat_map(|p| [p[0], p[1], p[2]]));
+                    let _ = std::fs::write(path, ppm);
+                    tracing::info!("saved a {}×{} screenshot at scale {}", shot.size.width, shot.size.height, shot.scale_factor);
+                }
+            }
+            Message::Navigate(page) => {
+                self.page = page;
+                if page == Page::Windows {
+                    self.send(Command::ListWindows);
+                }
+            }
             Message::Name(v) => self.form.name = v,
             Message::Port(v) => self.form.port = v,
             Message::PairAddress(v) => self.pair_address = v,
@@ -490,7 +558,7 @@ impl App {
         }
     }
 
-    fn on_event(&mut self, event: Event) {
+    fn on_event(&mut self, event: Event) -> Task<Message> {
         match event {
             Event::Ready { config, fingerprint, listening } => {
                 self.form = Form::from_config(&config);
@@ -566,6 +634,38 @@ impl App {
             Event::PairingFailed(reason) => self.pairing_error = Some(reason),
             Event::Nearby(list) => self.nearby = list,
             Event::Addresses(list) => self.addresses = list,
+            Event::ShareableWindows(list) => self.shareable = list,
+            Event::Sharing(list) => self.sharing = list,
+            Event::ShareFailed(reason) => self.share_error = Some(reason),
+            Event::WindowOpened { info, from, surface } => {
+                let (window, open) = window::open(window::Settings {
+                    size: self.exact_size(info.width, info.height),
+                    resizable: false,
+                    ..Default::default()
+                });
+                tracing::info!("showing “{}” from {from}: {}×{} px at scale {}", info.title, info.width, info.height, self.scale);
+                self.push_log(format!("{from} shared “{}”.", info.title));
+                self.remotes.insert(window, Remote { id: info.id, title: info.title, from, surface });
+                if std::env::var_os("DEXTR_TEST_SCREENSHOT").is_some() {
+                    let shot = Task::future(tokio::time::sleep(std::time::Duration::from_secs(2)))
+                        .then(move |()| window::screenshot(window))
+                        .map(Message::Screenshot);
+                    return open.discard().chain(shot);
+                }
+                return open.discard();
+            }
+            Event::WindowResized { id, width, height } => {
+                if let Some(w) = self.remote_window(id) {
+                    return window::resize(w, self.exact_size(width, height));
+                }
+            }
+            Event::WindowFrame { .. } => {}
+            Event::WindowClosed { id } => {
+                if let Some(w) = self.remote_window(id) {
+                    self.remotes.remove(&w);
+                    return window::close(w);
+                }
+            }
             Event::Log(line) => {
                 if line.starts_with("Connection failed") {
                     self.connecting = false;
@@ -579,10 +679,17 @@ impl App {
                 }
             }
         }
+        Task::none()
     }
 
-    fn view(&self) -> iced::Element<'_, Message> {
-        pages::view(self)
+    fn view(&self, window: window::Id) -> iced::Element<'_, Message> {
+        match self.remotes.get(&window) {
+            Some(r) => iced::widget::shader(remote_window::RemoteWindow { id: r.id, surface: r.surface.clone() })
+                .width(iced::Length::Fill)
+                .height(iced::Length::Fill)
+                .into(),
+            None => pages::view(self),
+        }
     }
 }
 

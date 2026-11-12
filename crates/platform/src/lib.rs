@@ -12,6 +12,8 @@
 //! every direction.
 
 use dextr_proto::{Button, Input, Key, Rect, Side};
+
+pub mod window;
 use tokio::sync::{mpsc, oneshot, watch};
 
 #[cfg(target_os = "linux")]

@@ -151,6 +151,58 @@ unsafe extern "C" {
     fn CGSSetConnectionProperty(cid: i32, target: i32, key: CFStringRef, value: CFTypeRef) -> i32;
 }
 
+// ── Window capture ──────────────────────────────────────────────────────
+
+pub type CFArrayRef = *const c_void;
+pub type CFDictionaryRef = *const c_void;
+pub type CFDataRef = *const c_void;
+pub type CGImageRef = *const c_void;
+
+pub const WINDOW_LIST_ON_SCREEN_ONLY: u32 = 1 << 0;
+pub const WINDOW_LIST_INCLUDING_WINDOW: u32 = 1 << 3;
+pub const WINDOW_LIST_EXCLUDE_DESKTOP: u32 = 1 << 4;
+pub const WINDOW_IMAGE_IGNORE_FRAMING: u32 = 1 << 0;
+pub const WINDOW_IMAGE_BEST_RESOLUTION: u32 = 1 << 3;
+pub const BITMAP_BYTE_ORDER_MASK: u32 = 0x7000;
+pub const BITMAP_BYTE_ORDER_32_LITTLE: u32 = 2 << 12;
+pub const CF_NUMBER_SINT64: isize = 4;
+
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    pub static CGRectNull: CGRect;
+    pub static kCGWindowNumber: CFStringRef;
+    pub static kCGWindowOwnerName: CFStringRef;
+    pub static kCGWindowOwnerPID: CFStringRef;
+    pub static kCGWindowName: CFStringRef;
+    pub static kCGWindowBounds: CFStringRef;
+    pub static kCGWindowLayer: CFStringRef;
+
+    pub fn CGWindowListCopyWindowInfo(option: u32, relative_to: u32) -> CFArrayRef;
+    pub fn CGWindowListCreateImage(bounds: CGRect, option: u32, window: u32, image_option: u32) -> CGImageRef;
+    pub fn CGRectMakeWithDictionaryRepresentation(dict: CFDictionaryRef, rect: *mut CGRect) -> bool;
+    pub fn CGImageGetWidth(image: CGImageRef) -> usize;
+    pub fn CGImageGetHeight(image: CGImageRef) -> usize;
+    pub fn CGImageGetBytesPerRow(image: CGImageRef) -> usize;
+    pub fn CGImageGetBitsPerPixel(image: CGImageRef) -> usize;
+    pub fn CGImageGetBitmapInfo(image: CGImageRef) -> u32;
+    pub fn CGImageGetDataProvider(image: CGImageRef) -> *const c_void;
+    pub fn CGDataProviderCopyData(provider: *const c_void) -> CFDataRef;
+    pub fn CGPreflightScreenCaptureAccess() -> bool;
+    pub fn CGRequestScreenCaptureAccess() -> bool;
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    pub fn CFArrayGetCount(array: CFArrayRef) -> isize;
+    pub fn CFArrayGetValueAtIndex(array: CFArrayRef, index: isize) -> *const c_void;
+    pub fn CFDictionaryGetValue(dict: CFDictionaryRef, key: *const c_void) -> *const c_void;
+    pub fn CFNumberGetValue(number: *const c_void, kind: isize, out: *mut c_void) -> bool;
+    pub fn CFStringGetLength(s: CFStringRef) -> isize;
+    pub fn CFStringGetCString(s: CFStringRef, buf: *mut c_char, size: isize, encoding: u32) -> bool;
+    pub fn CFDataGetBytePtr(data: CFDataRef) -> *const u8;
+    pub fn CFDataGetLength(data: CFDataRef) -> isize;
+}
+
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     pub static kCFRunLoopCommonModes: CFStringRef;

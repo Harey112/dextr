@@ -2,7 +2,7 @@ use dextr_core::{
     PairingState,
     edge::Link,
     Mode,
-    settings::{Appearance, Codec, FrameRate, ModifierMap, ReturnShortcut, StreamQuality},
+    settings::{Appearance, FrameRate, ModifierMap, ReturnShortcut},
 };
 use dextr_proto::{DEFAULT_PORT, Os, Rect, Side};
 use iced::{
@@ -233,7 +233,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
 fn sidebar(app: &App) -> Element<'_, Message> {
     let nav = column(Page::ALL.iter().map(|&p| {
         let label: Element<'_, Message> = if p == Page::Windows {
-            row![text(p.label()).size(14), space::horizontal(), text("Preview").size(11)].align_y(Alignment::Center).into()
+            row![text(p.label()).size(14), space::horizontal(), text("Beta").size(11)].align_y(Alignment::Center).into()
         } else {
             text(p.label()).size(14).into()
         };
@@ -768,71 +768,109 @@ fn keyboard(app: &App) -> Element<'_, Message> {
 
 fn windows(app: &App) -> Element<'_, Message> {
     let w = &app.config().windows;
-    let preview = banner(
-        column![
-            text("Window sharing is in development").size(14).font(SEMIBOLD),
-            text("These settings are saved now and take effect when window sharing arrives in a future update.").size(13),
-        ]
-        .spacing(4),
-        Tone::Active,
-    );
+    let connected = app.peer.is_some();
+    let can_share = connected && w.enabled;
 
-    let dragging = card(
-        "Dragging windows",
+    // Share a window: the OS picker on Linux, a list on macOS.
+    let mut share = column![muted(
+        "The window opens on the other device as a real window of its own, pixel for pixel. Click and type in it there; it stays on this device too."
+    )
+    .size(13)]
+    .spacing(12);
+    match &app.shareable {
+        Some(list) => {
+            share = share.push(row![
+                text("Windows on this device").size(14).width(Length::Fill),
+                button("Refresh").style(button::secondary).on_press(Message::ListWindows),
+            ]
+            .align_y(Alignment::Center));
+            for win in list {
+                share = share.push(
+                    row![
+                        column![text(win.title.as_str()).size(14), muted(win.app.as_str()).size(12)].spacing(2).width(Length::Fill),
+                        button("Share").style(button::primary).on_press_maybe(can_share.then_some(Message::ShareWindow(Some(win.id)))),
+                    ]
+                    .spacing(12)
+                    .align_y(Alignment::Center),
+                );
+            }
+        }
+        None => {
+            share = share.push(row![
+                space::horizontal(),
+                button("Choose a window…").style(button::primary).on_press_maybe(can_share.then_some(Message::ShareWindow(None))),
+            ]);
+        }
+    }
+    if !connected {
+        share = share.push(muted("Connect to your other device first.").size(12));
+    } else if !w.enabled {
+        share = share.push(muted("Window sharing is turned off below.").size(12));
+    }
+    if let Some(e) = &app.share_error {
+        share = share.push(banner(text(e.as_str()).size(13), Tone::Bad));
+    }
+
+    let mut page = column![heading("Windows", "Show a window from this device on the other one."), card("Share a window", share)].spacing(16);
+
+    if !app.sharing.is_empty() {
+        page = page.push(card(
+            "Shared now",
+            column(app.sharing.iter().map(|s| {
+                let note = if s.interactive { "Mouse and keyboard work on it" } else { "View only: its position on screen is unknown" };
+                row![
+                    column![text(s.title.as_str()).size(14), muted(note).size(12)].spacing(2).width(Length::Fill),
+                    button("Stop").style(button::secondary).on_press(Message::StopSharing(s.id)),
+                ]
+                .spacing(12)
+                .align_y(Alignment::Center)
+                .into()
+            }))
+            .spacing(12),
+        ));
+    }
+    if !app.remotes.is_empty() {
+        page = page.push(card(
+            "From the other device",
+            column(app.remotes.values().map(|r| {
+                let (pw, ph) = r.surface.size();
+                row![text(r.title.as_str()).size(14).width(Length::Fill), muted(format!("{pw} × {ph}")).size(12)]
+                    .spacing(12)
+                    .align_y(Alignment::Center)
+                    .into()
+            }))
+            .spacing(10),
+        ));
+    }
+
+    page.push(card(
+        "Settings",
         settings_list(vec![
-            switch(
-                "Drag windows to the other device",
-                "Move a window past the shared edge to show it on the other screen.",
-                w.enabled,
-                Setting::WindowsEnabled,
-            ),
+            switch("Window sharing", "Share windows with the other device, in both directions.", w.enabled, Setting::WindowsEnabled),
             switch(
                 "Accept windows from the other device",
-                "Let the other device show its windows here.",
+                "Let the other device open its windows here.",
                 w.accept_incoming,
                 Setting::WindowsAcceptIncoming,
             ),
-            switch(
-                "Bring windows back when disconnected",
-                "Windows return to their own device if the connection drops.",
-                w.return_on_disconnect,
-                Setting::ReturnOnDisconnect,
-            ),
-        ]),
-    );
-
-    let native = card(
-        "Native look",
-        settings_list(vec![
-            switch(
-                "Use the other device's window frame",
-                "Shown windows get that device's own title bar, shadow and taskbar entry.",
-                w.native_frames,
-                Setting::NativeFrames,
-            ),
-            switch("Match light and dark mode", "Switch the app to the other device's appearance.", w.match_theme, Setting::MatchTheme),
-            switch("Play sound where the window is", "Audio follows the window to the other device.", w.follow_audio, Setting::FollowAudio),
-        ]),
-    );
-
-    let quality = card(
-        "Quality",
-        settings_list(vec![
             choose(
-                "Picture",
-                "Sharpest text sends still content without loss. Low bandwidth suits slow Wi-Fi.",
-                StreamQuality::ALL,
-                w.quality,
-                Setting::Quality,
+                "Frame rate",
+                "Upper limit on updates. Only the parts that change are sent, without any loss of quality.",
+                FrameRate::ALL,
+                w.frame_rate,
+                Setting::FrameRate,
             ),
-            choose("Video codec", "Used for moving content. Automatic picks the best one both devices support in hardware.", Codec::ALL, w.codec, Setting::Codec),
-            choose("Frame rate", "Upper limit for moving content.", FrameRate::ALL, w.frame_rate, Setting::FrameRate),
         ]),
-    );
-
-    column![heading("Windows", "Move app windows between your devices."), preview, dragging, native, quality]
-        .spacing(16)
-        .into()
+    ))
+    .push(card(
+        "Good to know",
+        column![
+            muted("On Linux, the desktop asks which window to share each time. On KDE Plasma, dextr also finds the window on screen, so clicks and typing from the other device reach it; elsewhere it's shared view-only.").size(12),
+            muted("Dragging a window across the shared edge to send it isn't supported yet.").size(12),
+        ]
+        .spacing(6),
+    ))
+    .into()
 }
 
 // ── Activity ─────────────────────────────────────────────────────────────

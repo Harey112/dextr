@@ -18,6 +18,8 @@ Share one mouse and keyboard between computers, in any direction, written in Rus
 | Control the peer (capture) | ✅ InputCapture portal + libei | 🧪 Quartz event tap | ⏳ Raw Input + hook |
 | Be controlled (inject) | ✅ RemoteDesktop portal + libei | 🧪 CGEventPost | ⏳ SendInput |
 | Launch at login | ✅ autostart entry | 🧪 LaunchAgent | ⏳ |
+| Share a window (send) | ✅ ScreenCast portal + PipeWire; input on KDE Plasma | 🧪 Quartz window capture | ⏳ |
+| Show a shared window (receive) | ✅ | ✅ (same iced code) | ⏳ |
 
 ✅ works · 🧪 written, compiles for macOS, not yet tested on a Mac · ⏳ not started
 
@@ -87,6 +89,24 @@ Discovery broadcasts carry only a name, OS, port and fingerprint.
 
 Settings and the device certificate live in `~/.config/dextr/` on Linux and
 `~/Library/Application Support/dev.dextr.dextr/` on macOS.
+
+## Window sharing
+
+On the **Windows** page, press **Choose a window…** (Linux: the desktop's own picker) or pick one
+from the list (macOS). It opens on the other device as a real native window, with that device's own
+title bar and taskbar entry. Mouse, scrolling and keyboard in it go back to the original window.
+
+* **Pixel for pixel.** The window is captured at its real resolution (Retina too), and the receiving
+  window is sized so one of its pixels is one screen pixel, drawn without smoothing. Nothing is
+  scaled or video-compressed, so text is exactly as sharp as on the original.
+* **Only what changes is sent.** Frames are compared in 64×64 tiles and only changed tiles go over the
+  network, LZ4-compressed. A still window costs nothing. If the network is slower than the window
+  changes, frames are skipped, never queued, so it never lags behind.
+* **Linux:** no extra packages are needed (PipeWire is loaded at runtime). On KDE Plasma, a small KWin
+  script tells dextr where the window is, so input reaches it; on other desktops it's view-only.
+* **macOS:** needs **Screen Recording** permission (System Settings → Privacy & Security).
+
+The shared window stays on its own device too. Dragging a window across the edge isn't supported yet.
 
 ## How hand-off works
 

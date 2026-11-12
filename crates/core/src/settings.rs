@@ -162,71 +162,32 @@ impl KeyboardSettings {
     }
 }
 
-// ── Windows ──────────────────────────────────────────────────────────────
+// ── Windows ──────────────────────────────────────────────────────────
 
 choice!(
-    StreamQuality {
-        Auto => "Automatic",
-        SharpText => "Sharpest text",
-        Balanced => "Balanced",
-        LowBandwidth => "Low bandwidth",
-    } default Auto
-);
-
-choice!(
-    Codec {
-        Auto => "Automatic",
-        Av1 => "AV1",
-        Hevc => "HEVC (H.265)",
-        H264 => "H.264",
-        Lossless => "Lossless only",
-    } default Auto
-);
-
-choice!(
+    /// Upper limit on how often a shared window is updated.
     FrameRate {
-        Match => "Match display",
+        Match => "As fast as it changes",
         Fps30 => "30 fps",
         Fps60 => "60 fps",
         Fps120 => "120 fps",
     } default Match
 );
 
-/// Settings for dragging windows to the other device. Window sharing is not
-/// implemented yet; these are stored so they apply once it is.
+/// Sharing windows with the other device.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct WindowSettings {
-    /// Allow dragging windows across the shared edge.
+    /// Window sharing at all, in either direction.
     pub enabled: bool,
-    /// Draw the window with the other device's own title bar and shadow.
-    pub native_frames: bool,
-    /// Switch the app to the other device's light/dark mode.
-    pub match_theme: bool,
-    /// Bring windows back when the connection drops.
-    pub return_on_disconnect: bool,
-    /// Let the other device send its windows here.
+    /// Let the other device show its windows here.
     pub accept_incoming: bool,
-    /// Play audio from a moved window on the device it's shown on.
-    pub follow_audio: bool,
-    pub quality: StreamQuality,
-    pub codec: Codec,
     pub frame_rate: FrameRate,
 }
 
 impl Default for WindowSettings {
     fn default() -> Self {
-        Self {
-            enabled: true,
-            native_frames: true,
-            match_theme: true,
-            return_on_disconnect: true,
-            accept_incoming: true,
-            follow_audio: true,
-            quality: StreamQuality::Auto,
-            codec: Codec::Auto,
-            frame_rate: FrameRate::Match,
-        }
+        Self { enabled: true, accept_incoming: true, frame_rate: FrameRate::Match }
     }
 }
 
