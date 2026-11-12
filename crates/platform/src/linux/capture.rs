@@ -112,6 +112,23 @@ async fn open_session(proxy: &InputCapture) -> anyhow::Result<Session<InputCaptu
     }
 }
 
+/// Puts the barriers on `side`. Setting barriers suspends the session, so
+/// enable it again if it was on.
+async fn rearm(
+    portal: &Portal<'_>,
+    proxy: &InputCapture,
+    session: &Session<InputCapture>,
+    side: Side,
+    screens_tx: &watch::Sender<Vec<Rect>>,
+    enabled: bool,
+) -> anyhow::Result<()> {
+    portal.refresh(side, screens_tx).await?;
+    if enabled {
+        proxy.enable(session, EnableOptions::default()).await?;
+    }
+    Ok(())
+}
+
 async fn run(
     mut side: Side,
     mut commands: mpsc::UnboundedReceiver<CaptureCommand>,
@@ -154,6 +171,7 @@ async fn run(
     let mut activation_id = None;
     // Where capture last activated, while it is active (cursor hidden).
     let mut active: Option<(f32, f32)> = None;
+    let mut side_pending = false;
     let emit = |e: Captured| {
         let _ = events.send(CaptureEvent::Input(e));
     };
@@ -185,10 +203,19 @@ async fn run(
                         .set_activation_id(activation_id)
                         .set_cursor_position(Some((x as f64, y as f64)));
                     proxy.release(&session, options).await?;
+                    if std::mem::take(&mut side_pending) {
+                        rearm(&portal, &proxy, &session, side, &screens_tx, enabled).await?;
+                    }
                 }
                 Some(CaptureCommand::SetSide(new_side)) => {
                     side = new_side;
-                    portal.refresh(side, &screens_tx).await?;
+                    // New barriers reset the session, which would end an
+                    // active capture: wait until it's released.
+                    if active.is_some() {
+                        side_pending = true;
+                    } else {
+                        rearm(&portal, &proxy, &session, side, &screens_tx, enabled).await?;
+                    }
                 }
             },
             Some(signal) = activated.next() => {
@@ -210,6 +237,9 @@ async fn run(
             Some(_) = deactivated.next() => {
                 active = None;
                 let _ = events.send(CaptureEvent::Deactivated);
+                if std::mem::take(&mut side_pending) {
+                    rearm(&portal, &proxy, &session, side, &screens_tx, enabled).await?;
+                }
             }
             Some(_) = disabled.next() => {
                 // The compositor disables the session when screens change.

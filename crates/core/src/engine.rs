@@ -239,6 +239,9 @@ struct Engine {
     connecting: bool,
     /// Pointer is pushing against the edge, waiting for the switch delay.
     pending_switch: Option<PendingSwitch>,
+    /// The arrangement moved our edge while we controlled the peer; apply it
+    /// once the pointer is back.
+    capture_side_stale: bool,
     pairing: Option<Pairing>,
     next_pairing: u64,
     nearby: HashMap<Fingerprint, (Nearby, Instant)>,
@@ -346,6 +349,7 @@ async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: mpsc::Unbou
         reconnect_delay: RECONNECT_MIN,
         connecting: false,
         pending_switch: None,
+        capture_side_stale: false,
         pairing: None,
         next_pairing: 0,
         nearby: HashMap::new(),
@@ -756,6 +760,23 @@ impl Engine {
             self.mode = mode;
             let _ = self.events.send(Event::Mode(mode));
         }
+        if mode != Mode::Controlling && self.capture_side_stale {
+            self.update_capture_side();
+        }
+    }
+
+    /// Moves edge watching to the configured side. Not while controlling
+    /// the peer: re-arming the edge can end the capture and drop the pointer
+    /// back here, so it waits until the pointer comes home.
+    fn update_capture_side(&mut self) {
+        if self.mode == Mode::Controlling {
+            self.capture_side_stale = true;
+            return;
+        }
+        self.capture_side_stale = false;
+        if let Some(c) = &self.capture {
+            c.set_side(self.config.peer_side);
+        }
     }
 
     /// Our screens in the coordinate space the peer should use for Motion.
@@ -797,11 +818,7 @@ impl Engine {
     fn command(&mut self, command: Command) {
         match command {
             Command::Apply(mut new) => {
-                if new.peer_side != self.config.peer_side
-                    && let Some(c) = &self.capture
-                {
-                    c.set_side(new.peer_side);
-                }
+                let side_changed = new.peer_side != self.config.peer_side;
                 let rearranged = new.link() != self.config.link();
                 new.arranged_at = if rearranged { now_ms() } else { self.config.arranged_at };
                 *self.trusted.write().unwrap() = identity::parse(&new.peer_fingerprint);
@@ -822,6 +839,9 @@ impl Engine {
                 match self.config.save() {
                     Ok(()) => self.log("Settings saved.".into()),
                     Err(e) => self.log(format!("Cannot save settings: {e:#}")),
+                }
+                if side_changed {
+                    self.update_capture_side();
                 }
                 if rearranged {
                     self.send_arrangement();
@@ -863,8 +883,8 @@ impl Engine {
                     device_name: std::mem::take(&mut self.config.device_name),
                     ..Config::default()
                 };
-                if side_changed && let Some(c) = &self.capture {
-                    c.set_side(self.config.peer_side);
+                if side_changed {
+                    self.update_capture_side();
                 }
                 self.paused = false;
                 self.sync_capture();
@@ -1150,9 +1170,7 @@ impl Engine {
         }
         self.config.peer_side = link.side;
         self.config.peer_offset = link.offset;
-        if let Some(c) = &self.capture {
-            c.set_side(link.side);
-        }
+        self.update_capture_side();
         let name = self.session.as_ref().map(|s| s.peer.name.clone()).unwrap_or_default();
         self.save_and_publish(&format!("Display arrangement updated to match {name}."));
     }
