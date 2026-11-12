@@ -247,7 +247,12 @@ unsafe extern "C" fn callback(_proxy: CGEventTapProxy, kind: CGEventType, event:
             }
             return event;
         }
-        if CGEventGetIntegerValueField(event, FIELD_SOURCE_USER_DATA) == DEXTR_EVENT {
+        // Our own injected input (window input from the other device):
+        // never treat it as the user's hand. The tag can be lost on the way
+        // through the HID layer, the posting process ID can't.
+        if CGEventGetIntegerValueField(event, FIELD_SOURCE_USER_DATA) == DEXTR_EVENT
+            || CGEventGetIntegerValueField(event, FIELD_SOURCE_PID) == std::process::id() as i64
+        {
             return event;
         }
     }

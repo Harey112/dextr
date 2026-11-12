@@ -67,6 +67,7 @@ pub const FIELD_AUTOREPEAT: u32 = 8;
 pub const FIELD_KEYCODE: u32 = 9;
 pub const FIELD_SCROLL_DELTA_1: u32 = 11;
 pub const FIELD_SCROLL_DELTA_2: u32 = 12;
+pub const FIELD_SOURCE_PID: u32 = 41;
 pub const FIELD_SOURCE_USER_DATA: u32 = 42;
 pub const FIELD_SCROLL_CONTINUOUS: u32 = 88;
 pub const FIELD_SCROLL_POINT_DELTA_1: u32 = 96;

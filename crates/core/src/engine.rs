@@ -426,7 +426,9 @@ async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: mpsc::Unbou
                     injector_watch = Some(handle.clone());
                     engine.injector = Some(handle);
                     let _ = events.send(Event::InjectReady(Ok(())));
+                    engine.log("Remote input is ready: the other device can control this one.".into());
                     engine.report_screens();
+                    engine.resend_screens();
                     if token.is_some() && token != engine.config.inject_restore_token {
                         engine.config.inject_restore_token = token;
                         if let Err(e) = engine.config.save() {
@@ -436,6 +438,7 @@ async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: mpsc::Unbou
                 }
                 Internal::InjectorStarted(Err(e)) => {
                     engine.starting_injector = false;
+                    engine.log(format!("Remote input unavailable: {e:#}"));
                     let _ = events.send(Event::InjectReady(Err(format!("{e:#}"))));
                 }
                 Internal::CaptureStarted(Ok((handle, rx))) => {
@@ -444,10 +447,13 @@ async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: mpsc::Unbou
                     engine.sync_capture();
                     capture_rx = Some(rx);
                     let _ = events.send(Event::CaptureReady(Ok(())));
+                    engine.log("Input capture is ready: this mouse and keyboard can move to the other device.".into());
                     engine.report_screens();
+                    engine.resend_screens();
                 }
                 Internal::CaptureStarted(Err(e)) => {
                     engine.starting_capture = false;
+                    engine.log(format!("Input capture unavailable: {e:#}"));
                     let _ = events.send(Event::CaptureReady(Err(format!("{e:#}"))));
                 }
                 other => engine.internal(other),
@@ -873,6 +879,15 @@ impl Engine {
             } else {
                 c.disable();
             }
+        }
+    }
+
+    /// Tells the peer our screens again, e.g. once a backend that knows
+    /// them has started after we connected.
+    fn resend_screens(&self) {
+        let displays = self.hello().displays;
+        if !displays.is_empty() {
+            self.send(Message::Displays(displays));
         }
     }
 

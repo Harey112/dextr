@@ -575,7 +575,6 @@ impl App {
                 self.capture = match r {
                     Ok(()) => Access::Granted,
                     Err(e) => {
-                        self.push_log(format!("Input capture unavailable: {e}"));
                         Access::Denied(e)
                     }
                 }
@@ -584,7 +583,6 @@ impl App {
                 self.inject = match r {
                     Ok(()) => Access::Granted,
                     Err(e) => {
-                        self.push_log(format!("Remote input unavailable: {e}"));
                         Access::Denied(e)
                     }
                 }
