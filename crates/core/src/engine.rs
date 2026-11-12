@@ -23,7 +23,7 @@ use crate::{
     discovery::{self, LocalAddress},
     edge,
     identity::{self, Fingerprint, Identity},
-    settings::DisplayLayout,
+    settings::{Channel, DisplayLayout},
     tls,
     world::{self, Arrangement, DeviceId, World},
 };
@@ -229,13 +229,20 @@ struct Pairing {
     decide: Option<mpsc::UnboundedSender<bool>>,
 }
 
+/// How long a controlled device may stay silent before the pointer comes home.
+const TARGET_SILENT: Duration = Duration::from_millis(2500);
+
 struct Session {
     id: u64,
     dialed: bool,
     conn: quinn::Connection,
     out: mpsc::UnboundedSender<Message>,
     peer: Hello,
+    since: Instant,
 }
+
+/// Connections this close together are a simultaneous dial by both sides.
+const SIMULTANEOUS: Duration = Duration::from_secs(3);
 
 /// Connection state of one paired device.
 #[derive(Default)]
@@ -274,6 +281,8 @@ struct Engine {
     starting_injector: bool,
     /// Pointer is pushing against an edge, waiting for the switch delay.
     pending_switch: Option<PendingSwitch>,
+    /// While controlling: packets received from the target, and when that last changed.
+    heard: Option<(u64, Instant)>,
     /// The edges to watch changed while we controlled another device; apply
     /// them once the pointer is back.
     sides_stale: bool,
@@ -356,6 +365,8 @@ async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: mpsc::Unbou
     let addresses = discovery::local_addresses();
     let _ = events.send(Event::Addresses(addresses.clone()));
     let mut housekeeping = tokio::time::interval(Duration::from_secs(2));
+    let mut liveness = tokio::time::interval(Duration::from_millis(500));
+    liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let (clip_tx, mut clip_rx) = mpsc::unbounded_channel();
     let clipboard = match clipboard::start_clipboard(clip_tx) {
@@ -388,6 +399,7 @@ async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: mpsc::Unbou
         starting_capture: false,
         starting_injector: false,
         pending_switch: None,
+        heard: None,
         sides_stale: false,
         sides: Vec::new(),
         pairing: None,
@@ -484,6 +496,7 @@ async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: mpsc::Unbou
             Some((beacon, from)) = found_rx.recv() => engine.on_beacon(beacon, from),
             Some(content) = clip_rx.recv() => engine.local_clipboard(content),
             _ = housekeeping.tick() => engine.housekeeping(),
+            _ = liveness.tick(), if matches!(engine.mode, Mode::Controlling(_)) => engine.check_target(),
             note = injector_note(&mut injector_watch) => match note {
                 InjectorNote::Screens(screens) => {
                     engine.broadcast(Message::Displays(screens));
@@ -1052,7 +1065,7 @@ impl Engine {
                     inject_restore_token: self.config.inject_restore_token.take(),
                     peers: std::mem::take(&mut self.config.peers)
                         .into_iter()
-                        .map(|(id, p)| (id, PeerEntry { send: Default::default(), receive: Default::default(), ..p }))
+                        .map(|(id, p)| (id, PeerEntry { name: p.name, address: p.address, os: p.os, screens: p.screens, ..PeerEntry::default() }))
                         .collect(),
                     port: self.config.port,
                     device_name: std::mem::take(&mut self.config.device_name),
@@ -1335,35 +1348,33 @@ impl Engine {
 
     /// Something was copied here: send it to every device allowed to get it.
     fn local_clipboard(&mut self, content: ClipContent) {
-        let c = &self.config.clipboard;
-        if !c.enabled || self.sessions.is_empty() {
+        if !self.config.clipboard.enabled || self.sessions.is_empty() {
             return;
         }
+        let image = matches!(content, ClipContent::Png(_));
+        let size = content.len();
         let (message, what) = match content {
             ClipContent::Text(text) => {
                 let what = format!("text ({} characters)", text.chars().count());
                 (Clipboard::Text(text), what)
             }
-            ClipContent::Png(png) if c.images => {
+            ClipContent::Png(png) => {
                 let what = format!("an image ({} KB)", png.len().div_ceil(1024));
                 (Clipboard::Image { png }, what)
             }
-            ClipContent::Png(_) => return,
         };
-        let size = match &message {
-            Clipboard::Text(t) => t.len(),
-            Clipboard::Image { png } => png.len(),
-        };
-        if size > c.max_mb as usize * 1024 * 1024 {
-            self.log(format!("Didn't share the clipboard: {what} is over the {} MB limit.", c.max_mb));
-            return;
-        }
         let frame = match message.to_frame() {
             Ok(f) => Arc::new(f),
             Err(e) => return tracing::debug!("clipboard not encoded: {e}"),
         };
+        let mut too_big = Vec::new();
         for (id, session) in &self.sessions {
-            if !self.config.peer(id).send.clipboard {
+            let peer = self.config.peer(id);
+            if !peer.allows(Channel::Clipboard, true) || (image && !peer.clipboard.images) {
+                continue;
+            }
+            if size > peer.clipboard.max_mb as usize * 1024 * 1024 {
+                too_big.push(format!("{} ({} MB limit)", session.peer.name, peer.clipboard.max_mb));
                 continue;
             }
             tracing::debug!("sharing the clipboard with {}: {what}", session.peer.name);
@@ -1380,12 +1391,15 @@ impl Engine {
                 }
             });
         }
+        if !too_big.is_empty() {
+            self.log(format!("Didn't share {what} with {}: it's over the limit.", too_big.join(", ")));
+        }
     }
 
     /// A device copied something: put it on our clipboard.
     fn peer_clipboard(&mut self, from: &str, content: Clipboard) {
-        let c = &self.config.clipboard;
-        if !c.enabled || !self.config.peer(from).receive.clipboard {
+        let c = self.config.peer(from).clipboard;
+        if !self.config.clipboard.enabled || !self.config.peer(from).allows(Channel::Clipboard, false) {
             return;
         }
         let content = match content {
@@ -1504,14 +1518,17 @@ impl Engine {
             // Both devices dialed at once. Each keeps the connection dialed by
             // the device with the lower fingerprint, so both keep the same one.
             let we_are_lower = self.identity.fingerprint < fingerprint;
+            // An older connection means the device restarted (or its network
+            // changed) and that one is dead: take the new one.
             let preferred = |by_us: bool| by_us == we_are_lower;
-            if preferred(existing.dialed) || !preferred(dialed) {
+            let simultaneous = existing.since.elapsed() < SIMULTANEOUS;
+            if simultaneous && (preferred(existing.dialed) || !preferred(dialed)) {
                 conn.close(1u32.into(), b"busy");
                 tracing::debug!("refused a second connection from {}", peer.name);
                 return;
             }
-            tracing::debug!("replacing the connection to {} with the one both sides keep", peer.name);
-            self.end_session(&device, "replaced by a simultaneous connection".into());
+            tracing::debug!("replacing the connection to {} with a newer one", peer.name);
+            self.end_session(&device, "replaced by a newer connection".into());
         }
         let id = self.next_session;
         self.next_session += 1;
@@ -1569,7 +1586,7 @@ impl Engine {
             self.log(format!("{} reported no screens, so the pointer can't move there yet.", peer.name));
         }
         let out = out_tx.clone();
-        self.sessions.insert(device, Session { id, dialed, conn, out: out_tx, peer });
+        self.sessions.insert(device, Session { id, dialed, conn, out: out_tx, peer, since: Instant::now() });
         // Whichever device was arranged last wins.
         let _ = out.send(self.layout_message());
         self.rebuild_world();
@@ -1676,7 +1693,7 @@ impl Engine {
         let Some((target, entry)) = self.world.beyond(&self.me, (x, y), side).map(|(d, p)| (d.id.clone(), p)) else {
             return self.bounce(Some(side), (x, y));
         };
-        if !self.config.peer(&target).send.mouse {
+        if !self.config.peer(&target).allows(Channel::Mouse, true) {
             return self.bounce(Some(side), (x, y));
         }
         if self.config.switching.delay_ms > 0 {
@@ -1696,7 +1713,11 @@ impl Engine {
 
     /// The pointer moves onto `target` at its local point `at`.
     fn enter(&mut self, target: &str, at: (f32, f32)) {
-        let Some(device) = self.world.device(target) else { return };
+        let Some(device) = self.world.device(target).filter(|_| self.sessions.contains_key(target)) else {
+            // Gone meanwhile: never keep the pointer captured with nowhere to go.
+            return self.leave_to_local(self.pointer);
+        };
+        self.heard = None;
         self.pointer = device.to_world(at);
         self.ctrl_down = false;
         self.alt_down = false;
@@ -1754,7 +1775,7 @@ impl Engine {
         match input {
             Captured::Motion { dx, dy } => self.move_pointer(&target, dx, dy),
             Captured::Button { button, pressed } => {
-                let button = match (self.config.mouse.swap_buttons, button) {
+                let button = match (self.config.peer(&target).mouse.swap_buttons, button) {
                     (true, Button::Left) => Button::Right,
                     (true, Button::Right) => Button::Left,
                     (_, b) => b,
@@ -1763,11 +1784,11 @@ impl Engine {
                 self.send_to(&target, Message::Input(Input::Button { button, pressed, x, y }));
             }
             Captured::Scroll { dx, dy } => {
-                let k = self.scroll_factor();
+                let k = self.config.peer(&target).mouse.scroll_factor();
                 self.send_to(&target, Message::Input(Input::Scroll { dx: dx * k, dy: dy * k }));
             }
             Captured::ScrollDiscrete { dx, dy } => {
-                let k = self.scroll_factor();
+                let k = self.config.peer(&target).mouse.scroll_factor();
                 let scale = |v: i32| (v as f32 * k).round() as i32;
                 self.send_to(&target, Message::Input(Input::ScrollDiscrete { dx: scale(dx), dy: scale(dy) }));
             }
@@ -1793,11 +1814,12 @@ impl Engine {
                 }
                 // Keyboard off for this device: keys go nowhere while the
                 // pointer is over there (the shortcut above still works).
-                if !(self.config.keyboard.enabled && self.config.peer(&target).send.keyboard) {
+                let peer = self.config.peer(&target);
+                if !(self.config.keyboard.enabled && peer.allows(Channel::Keyboard, true)) {
                     return;
                 }
                 let peer_os = self.sessions.get(&target).map(|s| s.peer.os).unwrap_or(Os::Other);
-                let key = self.config.keyboard.remap(key, Os::current(), peer_os);
+                let key = peer.keyboard.remap(key, Os::current(), peer_os);
                 self.send_to(&target, Message::Input(Input::Key { key, pressed }));
             }
         }
@@ -1806,9 +1828,9 @@ impl Engine {
     /// Moves the pointer through the shared space: on the device it's over,
     /// onto the next device past an edge, or home.
     fn move_pointer(&mut self, target: &str, dx: f32, dy: f32) {
-        let Some(current) = self.world.device(target) else { return };
+        let Some(current) = self.world.device(target) else { return self.leave_to_local(self.pointer) };
         // Motion is in our pixels; move the same number of pixels over there.
-        let k = self.config.mouse.speed * current.scale;
+        let k = self.config.peer(target).mouse.speed * current.scale;
         let to = (self.pointer.0 + dx * k, self.pointer.1 + dy * k);
         let next = self.world.device_at(to).map(|d| d.id.clone());
         match next {
@@ -1817,7 +1839,7 @@ impl Engine {
                 self.send_motion(target, self.pointer_on(target));
             }
             Some(id) if id == self.me => self.leave_to_local(to),
-            Some(id) if self.config.peer(&id).send.mouse && self.sessions.contains_key(&id) => {
+            Some(id) if self.config.peer(&id).allows(Channel::Mouse, true) && self.sessions.contains_key(&id) => {
                 // On to the next device.
                 self.send_to(target, Message::Leave);
                 let at = self.world.device(&id).map_or(to, |d| d.to_local(to));
@@ -1832,11 +1854,6 @@ impl Engine {
         }
     }
 
-    fn scroll_factor(&self) -> f32 {
-        let m = &self.config.mouse;
-        if m.natural_scroll { -m.scroll_speed } else { m.scroll_speed }
-    }
-
     /// Our nearest point to `world_point`, a little inside our edges so the
     /// pointer doesn't land on one and switch straight back.
     fn home_point(&self, world_point: (f32, f32)) -> (f32, f32) {
@@ -1844,6 +1861,25 @@ impl Engine {
         let (x, y) = me.to_local(me.clamp(world_point));
         let b = me.bounds;
         (x.clamp(b.x as f32 + 2.0, b.right() - 3.0), y.clamp(b.y as f32 + 2.0, b.bottom() - 3.0))
+    }
+
+    /// While controlling: if the device stops answering (asleep, out of
+    /// range), bring the pointer home now instead of when the connection
+    /// times out. A live device acknowledges our keep-alives every second.
+    fn check_target(&mut self) {
+        let Mode::Controlling(target) = self.mode.clone() else { return };
+        let Some(session) = self.sessions.get(&target) else { return self.leave_to_local(self.pointer) };
+        let received = session.conn.stats().udp_rx.datagrams;
+        match self.heard {
+            Some((count, at)) if count == received => {
+                if at.elapsed() > TARGET_SILENT {
+                    let name = session.peer.name.clone();
+                    self.log(format!("{name} stopped responding: the pointer is back here."));
+                    self.leave_to_local(self.pointer);
+                }
+            }
+            _ => self.heard = Some((received, Instant::now())),
+        }
     }
 
     fn leave_to_local(&mut self, world_point: (f32, f32)) {
@@ -1863,7 +1899,7 @@ impl Engine {
         match message {
             Message::Enter { x, y } => {
                 let name = self.peer_name(from);
-                if !self.config.connection.allow_control || !self.config.peer(from).receive.mouse {
+                if !self.config.connection.allow_control || !self.config.peer(from).allows(Channel::Mouse, false) {
                     // Hand control straight back.
                     self.send_to(from, Message::Leave);
                     self.log(format!("{name} tried to take control, but its mouse isn't allowed here."));
@@ -1891,7 +1927,7 @@ impl Engine {
                 if self.mode != Mode::Controlled(from.to_owned()) {
                     return;
                 }
-                if matches!(input, Input::Key { .. }) && !self.config.peer(from).receive.keyboard {
+                if matches!(input, Input::Key { .. }) && !self.config.peer(from).allows(Channel::Keyboard, false) {
                     return; // its keyboard isn't allowed here
                 }
                 if let Some(i) = &self.injector {

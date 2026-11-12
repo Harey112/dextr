@@ -230,13 +230,10 @@ pub enum Setting {
     KeyboardEnabled(bool),
     /// A per-device rule: `outgoing` is from this device to `device`.
     Rule { device: String, outgoing: bool, channel: Channel, on: bool },
+    /// A choice for one paired device.
+    Peer { device: String, change: PeerChange },
     DeadCorners(u32),
     SwitchDelay(u32),
-    PointerSpeed(f32),
-    ScrollSpeed(f32),
-    NaturalScroll(bool),
-    SwapButtons(bool),
-    Modifiers(ModifierMap),
     ReturnShortcut(ReturnShortcut),
     AutoConnect(bool),
     AutoReconnect(bool),
@@ -244,6 +241,18 @@ pub enum Setting {
     AllowControl(bool),
     Appearance(Appearance),
     ClipboardEnabled(bool),
+}
+
+/// Per-device mouse, keyboard and clipboard choices.
+#[derive(Debug, Clone)]
+pub enum PeerChange {
+    /// The device's own switch for a page.
+    On(Channel, bool),
+    PointerSpeed(f32),
+    ScrollSpeed(f32),
+    NaturalScroll(bool),
+    SwapButtons(bool),
+    Modifiers(ModifierMap),
     ClipboardImages(bool),
     ClipboardMaxMb(u32),
 }
@@ -255,9 +264,10 @@ impl Setting {
             self,
             Setting::DeadCorners(_)
                 | Setting::SwitchDelay(_)
-                | Setting::PointerSpeed(_)
-                | Setting::ScrollSpeed(_)
-                | Setting::ClipboardMaxMb(_)
+                | Setting::Peer {
+                    change: PeerChange::PointerSpeed(_) | PeerChange::ScrollSpeed(_) | PeerChange::ClipboardMaxMb(_),
+                    ..
+                }
         )
     }
 
@@ -272,13 +282,23 @@ impl Setting {
                     if outgoing { rules.send.set(channel, on) } else { rules.receive.set(channel, on) }
                 }
             }
+            Setting::Peer { device, change } => {
+                let Some(p) = c.peers.get_mut(&device) else { return };
+                match change {
+                    PeerChange::On(Channel::Mouse, v) => p.mouse.on = v,
+                    PeerChange::On(Channel::Keyboard, v) => p.keyboard.on = v,
+                    PeerChange::On(Channel::Clipboard, v) => p.clipboard.on = v,
+                    PeerChange::PointerSpeed(v) => p.mouse.speed = v,
+                    PeerChange::ScrollSpeed(v) => p.mouse.scroll_speed = v,
+                    PeerChange::NaturalScroll(v) => p.mouse.natural_scroll = v,
+                    PeerChange::SwapButtons(v) => p.mouse.swap_buttons = v,
+                    PeerChange::Modifiers(v) => p.keyboard.modifiers = v,
+                    PeerChange::ClipboardImages(v) => p.clipboard.images = v,
+                    PeerChange::ClipboardMaxMb(v) => p.clipboard.max_mb = v,
+                }
+            }
             Setting::DeadCorners(v) => c.switching.dead_corners = v,
             Setting::SwitchDelay(v) => c.switching.delay_ms = v,
-            Setting::PointerSpeed(v) => c.mouse.speed = v,
-            Setting::ScrollSpeed(v) => c.mouse.scroll_speed = v,
-            Setting::NaturalScroll(v) => c.mouse.natural_scroll = v,
-            Setting::SwapButtons(v) => c.mouse.swap_buttons = v,
-            Setting::Modifiers(v) => c.keyboard.modifiers = v,
             Setting::ReturnShortcut(v) => c.keyboard.return_shortcut = v,
             Setting::AutoConnect(v) => c.connection.auto_connect = v,
             Setting::AutoReconnect(v) => c.connection.auto_reconnect = v,
@@ -286,8 +306,6 @@ impl Setting {
             Setting::AllowControl(v) => c.connection.allow_control = v,
             Setting::Appearance(v) => c.appearance = v,
             Setting::ClipboardEnabled(v) => c.clipboard.enabled = v,
-            Setting::ClipboardImages(v) => c.clipboard.images = v,
-            Setting::ClipboardMaxMb(v) => c.clipboard.max_mb = v,
         }
     }
 }

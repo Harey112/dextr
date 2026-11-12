@@ -127,9 +127,10 @@ automatically until you move them.
 
 ## What goes where
 
-The **Mouse**, **Keyboard** and **Clipboard** pages each have a main switch, and a **Devices** list with
-a switch per direction for every paired device (this device → it, and it → this device). Both the
-main switch and the device's switch must be on. Turning the mouse off keeps the pointer (and so the
+The **Mouse**, **Keyboard** and **Clipboard** pages each have a main switch, and a card per paired
+device with its own switch, a switch per direction (this device → it, and it → this device), and its
+own options: pointer and scroll speed, natural scrolling and swapped buttons; modifier keys; images
+and the largest copy. All the switches on the way must be on. Turning the mouse off keeps the pointer (and so the
 keyboard) on this device; turning the keyboard off keeps keys from being sent while the pointer is
 over there.
 

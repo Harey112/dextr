@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     settings::{
-        Appearance, ClipboardSettings, ConnectionSettings, DeviceRules, Direction, DisplayLayout, KeyboardSettings, MouseSettings,
-        SwitchingSettings,
+        Appearance, Channel, ClipboardSettings, ConnectionSettings, DeviceRules, Direction, DisplayLayout, KeyboardSettings,
+        MouseSettings, PeerClipboard, PeerKeyboard, PeerMouse, SwitchingSettings,
     },
     world::{Arrangement, DeviceId},
 };
@@ -28,11 +28,37 @@ pub struct PeerEntry {
     pub send: Direction,
     /// What comes from it to this device.
     pub receive: Direction,
+    /// This mouse on it.
+    pub mouse: PeerMouse,
+    /// This keyboard on it.
+    pub keyboard: PeerKeyboard,
+    /// The clipboard with it.
+    pub clipboard: PeerClipboard,
 }
+
+impl PeerEntry {
+    /// Whether `channel` is shared with this device in one direction: its
+    /// switch and that direction's switch must both be on.
+    pub fn allows(&self, channel: Channel, outgoing: bool) -> bool {
+        let on = match channel {
+            Channel::Mouse => self.mouse.on,
+            Channel::Keyboard => self.keyboard.on,
+            Channel::Clipboard => self.clipboard.on,
+        };
+        on && if outgoing { self.send.get(channel) } else { self.receive.get(channel) }
+    }
+}
+
+/// Settings file format: 2 moved mouse, keyboard and clipboard options into
+/// each device.
+const VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct Config {
+    /// Format of the file, for moving old settings ([`VERSION`]).
+    #[serde(default)]
+    pub version: u32,
     /// Shown to other devices.
     pub device_name: String,
     /// UDP port this device listens on.
@@ -80,6 +106,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            version: VERSION,
             device_name: hostname(),
             port: DEFAULT_PORT,
             peers: BTreeMap::new(),
@@ -140,6 +167,24 @@ impl Config {
 
     /// Moves settings from the single-peer versions into `peers`.
     fn migrate(&mut self) {
+        self.migrate_peers();
+        if self.version < 2 {
+            // Mouse, keyboard and clipboard options were the same for every
+            // device: start each device with them.
+            let m = &self.mouse;
+            let mouse = PeerMouse { on: true, speed: m.speed, scroll_speed: m.scroll_speed, natural_scroll: m.natural_scroll, swap_buttons: m.swap_buttons };
+            let keyboard = PeerKeyboard { on: true, modifiers: self.keyboard.modifiers };
+            let clipboard = PeerClipboard { on: true, images: self.clipboard.images, max_mb: self.clipboard.max_mb };
+            for p in self.peers.values_mut() {
+                p.mouse = mouse.clone();
+                p.keyboard = keyboard.clone();
+                p.clipboard = clipboard.clone();
+            }
+        }
+        self.version = VERSION;
+    }
+
+    fn migrate_peers(&mut self) {
         if let Some(side) = self.peer_side.take() {
             self.new_device_side = side;
         }
@@ -153,6 +198,7 @@ impl Config {
             screens: std::mem::take(&mut self.last_peer_screens),
             send: rules.send,
             receive: rules.receive,
+            ..PeerEntry::default()
         });
         self.devices.clear();
     }
@@ -190,7 +236,7 @@ mod tests {
         let fp = "AB".repeat(32);
         let old = format!(
             "device_name = \"laptop\"\npeer_address = \"10.0.0.2\"\npeer_fingerprint = \"{fp}\"\npeer_side = \"Left\"\n\
-             last_peer_name = \"Mac\"\nlayout = \"Proportional\"\n\n[devices.\"{id}\".send]\nclipboard = false\n",
+             last_peer_name = \"Mac\"\nlayout = \"Proportional\"\n\n[mouse]\nspeed = 1.5\n\n[clipboard]\nimages = false\n\n[devices.\"{id}\".send]\nclipboard = false\n",
             id = crate::identity::format(&crate::identity::parse(&fp).unwrap()),
         );
         let mut c: Config = toml::from_str(&old).unwrap();
@@ -201,6 +247,9 @@ mod tests {
         assert!(!peer.send.clipboard && peer.send.mouse);
         assert_eq!(c.new_device_side, Side::Left);
         assert_eq!(c.layout, DisplayLayout::Proportional);
+        assert_eq!(peer.mouse.speed, 1.5);
+        assert!(!peer.clipboard.images);
+        assert_eq!(c.version, VERSION);
         // Saved without the old fields; loads back the same.
         let again: Config = toml::from_str(&toml::to_string_pretty(&c).unwrap()).unwrap();
         assert_eq!(again.peers, c.peers);

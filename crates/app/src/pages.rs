@@ -1,4 +1,5 @@
 use dextr_core::{
+    config::PeerEntry,
     Mode, PairingState,
     settings::{Appearance, Channel, DisplayLayout, ModifierMap, ReturnShortcut},
 };
@@ -10,7 +11,7 @@ use iced::{
     },
 };
 
-use crate::{Access, App, Danger, Message, Page, Setting, arrangement::Arrangement, autostart, os_name};
+use crate::{Access, App, Danger, Message, Page, PeerChange, Setting, arrangement::Arrangement, autostart, os_name};
 
 // ── Type and icons ───────────────────────────────────────────────────────
 
@@ -35,19 +36,16 @@ mod ic {
     pub const TRASH: char = '\u{e18e}';
     pub const REFRESH: char = '\u{e145}';
     pub const LAPTOP: char = '\u{e1cd}';
-    pub const POINTER: char = '\u{e1c3}';
     pub const SHIELD: char = '\u{e1ff}';
     pub const PALETTE: char = '\u{e1dd}';
     pub const FOLDER: char = '\u{e247}';
     pub const ROTATE: char = '\u{e148}';
     pub const RADAR: char = '\u{e497}';
     pub const NETWORK: char = '\u{e125}';
-    pub const SCROLL: char = '\u{e2ed}';
     pub const TO: char = '\u{e049}';
     pub const SLIDERS: char = '\u{e29a}';
     pub const ROCKET: char = '\u{e286}';
     pub const INFO: char = '\u{e0f9}';
-    pub const COMMAND: char = '\u{e09a}';
     pub const ZAP: char = '\u{e1b4}';
     pub const FINGERPRINT: char = '\u{e2cb}';
     pub const CHECK: char = '\u{e06c}';
@@ -220,11 +218,11 @@ fn setting<'a>(title: &'a str, description: &'a str, control: impl Into<Element<
     .into()
 }
 
-fn switch<'a>(title: &'a str, description: &'a str, on: bool, f: fn(bool) -> Setting) -> Element<'a, Message> {
+fn switch<'a>(title: &'a str, description: &'a str, on: bool, f: impl Fn(bool) -> Setting + 'a) -> Element<'a, Message> {
     setting(title, description, toggler(on).on_toggle(move |v| Message::Set(f(v))))
 }
 
-fn choose<'a, T>(title: &'a str, description: &'a str, options: &'static [T], value: T, f: fn(T) -> Setting) -> Element<'a, Message>
+fn choose<'a, T>(title: &'a str, description: &'a str, options: &'static [T], value: T, f: impl Fn(T) -> Setting + 'a) -> Element<'a, Message>
 where
     T: ToString + PartialEq + Clone + 'static,
 {
@@ -239,7 +237,7 @@ fn slide<'a>(
     step: f32,
     value: f32,
     shown: String,
-    f: fn(f32) -> Setting,
+    f: impl Fn(f32) -> Setting + 'a,
 ) -> Element<'a, Message> {
     setting(
         title,
@@ -467,56 +465,79 @@ fn arrangement_canvas(app: &App, interactive: bool, height: f32) -> Element<'_, 
     .into()
 }
 
-// ── Per-device rules ─────────────────────────────────────────────────────
+// ── Per device ───────────────────────────────────────────────────────────
 
-/// Each paired device, with a switch per direction for `channel`.
-fn device_rules<'a>(app: &'a App, channel: Channel) -> Element<'a, Message> {
+/// One card per paired device for `channel`: its own switch in the header,
+/// then a switch per direction and the device's own `options`.
+fn device_cards<'a>(
+    app: &'a App,
+    channel: Channel,
+    options: impl Fn(&'a str, &'a PeerEntry) -> Vec<Element<'a, Message>>,
+) -> Element<'a, Message> {
     let devices = &app.config().peers;
     if devices.is_empty() {
-        return card(ic::LAPTOP, "Devices", muted("Pair and connect a device to choose what goes to it and what comes from it."));
+        return card(ic::LAPTOP, "Devices", muted("Pair a device on the Pairing page to choose what's shared with it."));
     }
     let me = this_name(app);
-    let rows = devices.iter().map(|(fp, rules)| {
-        let name = if rules.name.is_empty() { "Paired device" } else { rules.name.as_str() };
-        let rule = |outgoing: bool, on: bool| {
-            let device = fp.clone();
-            toggler(on).on_toggle(move |v| Message::Set(Setting::Rule { device: device.clone(), outgoing, channel, on: v }))
+    column(devices.iter().map(|(id, p)| {
+        let name = if p.name.is_empty() { "Paired device" } else { p.name.as_str() };
+        let on = match channel {
+            Channel::Mouse => p.mouse.on,
+            Channel::Keyboard => p.keyboard.on,
+            Channel::Clipboard => p.clipboard.on,
         };
-        let direction = |from: String, to: String, outgoing: bool, on: bool| -> Element<'a, Message> {
-            row![
-                row![
-                    text(from).size(13).font(MEDIUM),
-                    icon(ic::TO).size(14),
-                    text(to).size(13).font(MEDIUM),
-                ]
-                .spacing(8)
-                .align_y(Alignment::Center)
-                .width(Length::Fill),
-                rule(outgoing, on),
-            ]
-            .align_y(Alignment::Center)
-            .into()
-        };
-        column![
-            row![
-                icon(ic::LAPTOP),
-                text(name).size(14).font(SEMIBOLD),
-                device_chip(app, fp),
-            ]
-            .spacing(10)
-            .align_y(Alignment::Center),
-            direction(me.to_string(), name.to_string(), true, rules.send.get(channel)),
-            direction(name.to_string(), me.to_string(), false, rules.receive.get(channel)),
+        let set = move |change: PeerChange| Message::Set(Setting::Peer { device: id.clone(), change });
+        let header = row![
+            icon(ic::LAPTOP).size(17).style(|theme: &Theme| text::Style { color: Some(theme.extended_palette().primary.base.color) }),
+            text(name).size(15).font(SEMIBOLD),
+            device_chip(app, id),
+            space::horizontal(),
+            toggler(on).size(22).on_toggle(move |v| set(PeerChange::On(channel, v))),
         ]
-        .spacing(12)
-        .into()
-    });
-    card_help(
-        ic::LAPTOP,
-        "Devices",
-        "Choose, per device and per direction, what is shared. It's shared only when both this switch and the page's main switch are on.",
-        column(rows).spacing(20),
-    )
+        .spacing(10)
+        .align_y(Alignment::Center);
+        let mut body = column![header].spacing(16);
+        if on {
+            let direction = |from: &'a str, to: &'a str, outgoing: bool, value: bool| -> Element<'a, Message> {
+                let device = id.clone();
+                row![
+                    row![text(from).size(14), icon(ic::TO).size(14), text(to).size(14)]
+                        .spacing(8)
+                        .align_y(Alignment::Center)
+                        .width(Length::Fill),
+                    toggler(value).on_toggle(move |v| Message::Set(Setting::Rule { device: device.clone(), outgoing, channel, on: v })),
+                ]
+                .align_y(Alignment::Center)
+                .into()
+            };
+            let mut items = vec![
+                direction(me, name, true, p.send.get(channel)),
+                direction(name, me, false, p.receive.get(channel)),
+            ];
+            items.extend(options(id, p));
+            body = body.push(settings_list(items));
+        } else {
+            body = body.push(muted(format!("Not shared with {name}, in either direction.")).size(13));
+        }
+        container(body)
+            .padding(20)
+            .width(Length::Fill)
+            .style(|theme: &Theme| {
+                let p = theme.extended_palette();
+                container::Style {
+                    background: Some(Background::Color(p.background.weaker.color)),
+                    border: Border { radius: 12.0.into(), width: 1.0, color: p.background.weak.color },
+                    ..container::Style::default()
+                }
+            })
+            .into()
+    }))
+    .spacing(18)
+    .into()
+}
+
+fn peer_set(device: &str, change: PeerChange) -> Setting {
+    Setting::Peer { device: device.to_owned(), change }
 }
 
 // ── Overview ─────────────────────────────────────────────────────────────
@@ -938,53 +959,26 @@ fn mouse(app: &App) -> Element<'_, Message> {
     let mut page = column![heading(
         ic::MOUSE,
         "Mouse",
-        "How this mouse behaves on other devices.",
+        "How this mouse behaves on each device.",
         Some(master("Share mouse", m.enabled, Setting::MouseEnabled)),
     )]
     .spacing(18);
     if !m.enabled {
         page = page.push(off_banner("The mouse is off: the pointer stays on this device (and so does the keyboard)."));
     }
-    let pointer = card(
-        ic::POINTER,
-        "Pointer",
-        settings_list(vec![
-            slide(
-                "Pointer speed",
-                "",
-                0.25..=3.0,
-                0.05,
-                m.speed,
-                format!("{:.2}×", m.speed),
-                Setting::PointerSpeed,
-            ),
-            switch("Swap left and right buttons", "", m.swap_buttons, Setting::SwapButtons),
-        ]),
-    );
-    let scrolling = card(
-        ic::SCROLL,
-        "Scrolling",
-        settings_list(vec![
-            slide(
-                "Scroll speed",
-                "",
-                0.25..=3.0,
-                0.05,
-                m.scroll_speed,
-                format!("{:.2}×", m.scroll_speed),
-                Setting::ScrollSpeed,
-            ),
-            switch(
-                "Natural scrolling",
-                "",
-                m.natural_scroll,
-                Setting::NaturalScroll,
-            ),
-        ]),
-    );
-    page.push(device_rules(app, Channel::Mouse))
-    .push(pointer)
-    .push(scrolling)
+    page.push(device_cards(app, Channel::Mouse, |id, p| {
+        let m = &p.mouse;
+        vec![
+            slide("Pointer speed", "", 0.25..=3.0, 0.05, m.speed, format!("{:.2}×", m.speed), move |v| {
+                peer_set(id, PeerChange::PointerSpeed(v))
+            }),
+            slide("Scroll speed", "", 0.25..=3.0, 0.05, m.scroll_speed, format!("{:.2}×", m.scroll_speed), move |v| {
+                peer_set(id, PeerChange::ScrollSpeed(v))
+            }),
+            switch("Natural scrolling", "", m.natural_scroll, move |v| peer_set(id, PeerChange::NaturalScroll(v))),
+            switch("Swap left and right buttons", "", m.swap_buttons, move |v| peer_set(id, PeerChange::SwapButtons(v))),
+        ]
+    }))
     .into()
 }
 
@@ -992,25 +986,11 @@ fn mouse(app: &App) -> Element<'_, Message> {
 
 fn keyboard(app: &App) -> Element<'_, Message> {
     let k = &app.config().keyboard;
-    let explain = if app.config().peers.is_empty() {
-        "Automatic swaps Ctrl and Cmd when exactly one of the two devices is a Mac, so copy and paste stay under the same finger.".to_owned()
-    } else {
-        app.config()
-            .peers
-            .keys()
-            .filter_map(|id| {
-                let os = app.peer_os(id)?;
-                let effective = k.effective(Os::current(), os);
-                Some(format!("With {} ({}): {}.", app.device_name(id), os_name(os), effective.to_string().to_lowercase()))
-            })
-            .collect::<Vec<_>>()
-            .join("  ")
-    };
 
     let mut page = column![heading(
         ic::KEYBOARD,
         "Keyboard",
-        "How this keyboard behaves on other devices.",
+        "How this keyboard behaves on each device.",
         Some(master("Share keyboard", k.enabled, Setting::KeyboardEnabled)),
     )]
     .spacing(18);
@@ -1018,15 +998,22 @@ fn keyboard(app: &App) -> Element<'_, Message> {
         page = page.push(off_banner("The keyboard is off: keys aren't sent while the pointer is on another device. The shortcut back still works."));
     }
 
-    let modifiers = card(
-        ic::COMMAND,
-        "Modifier keys",
-        column![
-            choose("Mapping", "", ModifierMap::ALL, k.modifiers, Setting::Modifiers),
-            muted(explain).size(12),
-        ]
-        .spacing(10),
-    );
+    let devices = device_cards(app, Channel::Keyboard, |id, p| {
+        let mut items = vec![choose(
+            "Modifier keys",
+            "Automatic swaps Ctrl and Cmd when exactly one of the two devices is a Mac, so copy and paste stay under the same finger.",
+            ModifierMap::ALL,
+            p.keyboard.modifiers,
+            move |v| peer_set(id, PeerChange::Modifiers(v)),
+        )];
+        if p.keyboard.modifiers == ModifierMap::Automatic
+            && let Some(os) = app.peer_os(id)
+        {
+            let effective = p.keyboard.effective(Os::current(), os);
+            items.push(muted(format!("With {}: {}.", os_name(os), effective.to_string().to_lowercase())).size(12).into());
+        }
+        items
+    });
 
     let shortcut_keys: Element<'_, Message> = match k.return_shortcut {
         ReturnShortcut::CtrlAltEsc => row![keycap("Ctrl"), text("+").size(13), keycap("Alt"), text("+").size(13), keycap("Esc")]
@@ -1052,8 +1039,7 @@ fn keyboard(app: &App) -> Element<'_, Message> {
         .spacing(10),
     );
 
-    page.push(device_rules(app, Channel::Keyboard))
-    .push(modifiers)
+    page.push(devices)
     .push(shortcuts)
     .push(card_help(
         ic::KEYBOARD,
@@ -1078,25 +1064,27 @@ fn clipboard(app: &App) -> Element<'_, Message> {
     if !c.enabled {
         page = page.push(off_banner("The clipboard is off: copies stay on the device they were made on."));
     }
-    let options = card_help(
-        ic::SLIDERS,
-        "Options",
-        "Whatever you copy is sent right away over the encrypted connection, so it's ready to paste wherever the pointer is. Text and images are supported; files aren't yet. Copies over the size limit stay on their device.",
-        settings_list(vec![
-            switch("Include images", "", c.images, Setting::ClipboardImages),
+    let devices = device_cards(app, Channel::Clipboard, |id, p| {
+        let c = &p.clipboard;
+        vec![
+            switch("Include images", "", c.images, move |v| peer_set(id, PeerChange::ClipboardImages(v))),
             slide(
                 "Largest copy",
-                "",
+                "Bigger copies aren't shared with this device, in either direction.",
                 1.0..=256.0,
                 1.0,
                 c.max_mb as f32,
                 format!("{} MB", c.max_mb),
-                |v| Setting::ClipboardMaxMb(v as u32),
+                move |v| peer_set(id, PeerChange::ClipboardMaxMb(v as u32)),
             ),
-        ]),
-    );
-    page.push(device_rules(app, Channel::Clipboard))
-    .push(options)
+        ]
+    });
+    page.push(devices)
+    .push(card(
+        ic::INFO,
+        "How it works",
+        muted("Whatever you copy is sent right away over the encrypted connection, so it's ready to paste wherever the pointer is. Text and images are supported; files aren't yet.").size(13),
+    ))
     .into()
 }
 

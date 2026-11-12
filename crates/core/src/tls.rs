@@ -29,7 +29,7 @@ fn provider() -> Arc<CryptoProvider> {
 
 fn transport() -> Arc<quinn::TransportConfig> {
     let mut t = quinn::TransportConfig::default();
-    t.keep_alive_interval(Some(Duration::from_secs(3)));
+    t.keep_alive_interval(Some(Duration::from_secs(1)));
     t.max_idle_timeout(Some(Duration::from_secs(10).try_into().unwrap()));
     Arc::new(t)
 }

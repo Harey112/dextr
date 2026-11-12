@@ -204,7 +204,15 @@ async fn run(
                     let options = ReleaseOptions::default()
                         .set_activation_id(activation_id)
                         .set_cursor_position(Some((x as f64, y as f64)));
-                    proxy.release(&session, options).await?;
+                    if let Err(e) = proxy.release(&session, options).await {
+                        // The pointer would stay hidden: disabling ends the
+                        // capture for sure, then watch the edges again.
+                        tracing::warn!("releasing the pointer failed ({e}); resetting capture");
+                        proxy.disable(&session, DisableOptions::default()).await?;
+                        if enabled {
+                            proxy.enable(&session, EnableOptions::default()).await?;
+                        }
+                    }
                     if std::mem::take(&mut side_pending) {
                         rearm(&portal, &proxy, &session, &sides, &screens_tx, enabled).await?;
                     }
@@ -247,6 +255,11 @@ async fn run(
                 // The compositor disables the session when screens change.
                 // Re-arm it with fresh barriers if we were active.
                 tracing::info!("capture disabled by compositor");
+                if active.take().is_some() {
+                    // That ended the capture: the pointer is back here.
+                    let _ = events.send(CaptureEvent::Deactivated);
+                }
+                side_pending = false;
                 if enabled {
                     portal.refresh(&sides, &screens_tx).await?;
                     proxy.enable(&session, EnableOptions::default()).await?;

@@ -77,19 +77,53 @@ impl Default for SwitchingSettings {
 pub struct MouseSettings {
     /// Master switch: share this mouse with other devices at all.
     pub enabled: bool,
-    /// Multiplies pointer movement on the other device.
+    /// Before per-device settings: moved into each device's [`PeerMouse`].
+    #[serde(skip_serializing)]
+    #[doc(hidden)]
     pub speed: f32,
-    /// Multiplies scrolling on the other device.
+    #[serde(skip_serializing)]
+    #[doc(hidden)]
     pub scroll_speed: f32,
-    /// Reverse scroll direction on the other device.
+    #[serde(skip_serializing)]
+    #[doc(hidden)]
     pub natural_scroll: bool,
-    /// Swap the left and right buttons on the other device.
+    #[serde(skip_serializing)]
+    #[doc(hidden)]
     pub swap_buttons: bool,
 }
 
 impl Default for MouseSettings {
     fn default() -> Self {
         Self { enabled: true, speed: 1.0, scroll_speed: 1.0, natural_scroll: false, swap_buttons: false }
+    }
+}
+
+/// How this mouse behaves on one other device.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct PeerMouse {
+    /// Share the mouse with this device at all (both directions).
+    pub on: bool,
+    /// Multiplies pointer movement on that device.
+    pub speed: f32,
+    /// Multiplies scrolling on that device.
+    pub scroll_speed: f32,
+    /// Reverse scroll direction on that device.
+    pub natural_scroll: bool,
+    /// Swap the left and right buttons on that device.
+    pub swap_buttons: bool,
+}
+
+impl Default for PeerMouse {
+    fn default() -> Self {
+        Self { on: true, speed: 1.0, scroll_speed: 1.0, natural_scroll: false, swap_buttons: false }
+    }
+}
+
+impl PeerMouse {
+    /// Scroll multiplier, negative for natural scrolling.
+    pub fn scroll_factor(&self) -> f32 {
+        if self.natural_scroll { -self.scroll_speed } else { self.scroll_speed }
     }
 }
 
@@ -130,8 +164,12 @@ impl ReturnShortcut {
 pub struct KeyboardSettings {
     /// Master switch: send this keyboard to other devices at all.
     pub enabled: bool,
-    pub modifiers: ModifierMap,
+    /// Works from every device.
     pub return_shortcut: ReturnShortcut,
+    /// Before per-device settings: moved into each device's [`PeerKeyboard`].
+    #[serde(skip_serializing)]
+    #[doc(hidden)]
+    pub modifiers: ModifierMap,
 }
 
 impl Default for KeyboardSettings {
@@ -140,7 +178,22 @@ impl Default for KeyboardSettings {
     }
 }
 
-impl KeyboardSettings {
+/// How this keyboard behaves on one other device.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct PeerKeyboard {
+    /// Share the keyboard with this device at all (both directions).
+    pub on: bool,
+    pub modifiers: ModifierMap,
+}
+
+impl Default for PeerKeyboard {
+    fn default() -> Self {
+        Self { on: true, modifiers: ModifierMap::default() }
+    }
+}
+
+impl PeerKeyboard {
     /// The mapping actually used between these two OSes. Automatic swaps Ctrl
     /// and Cmd when exactly one side is a Mac, so copy and paste stay under
     /// the same finger.
@@ -245,10 +298,31 @@ impl Direction {
 pub struct ClipboardSettings {
     /// Copy on one device, paste on the other.
     pub enabled: bool,
+    /// Before per-device settings: moved into each device's [`PeerClipboard`].
+    #[serde(skip_serializing)]
+    #[doc(hidden)]
+    pub images: bool,
+    #[serde(skip_serializing)]
+    #[doc(hidden)]
+    pub max_mb: u32,
+}
+
+/// Sharing the clipboard with one other device.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct PeerClipboard {
+    /// Share the clipboard with this device at all (both directions).
+    pub on: bool,
     /// Also share copied images.
     pub images: bool,
     /// Larger copies aren't shared, in megabytes.
     pub max_mb: u32,
+}
+
+impl Default for PeerClipboard {
+    fn default() -> Self {
+        Self { on: true, images: true, max_mb: 32 }
+    }
 }
 
 impl Default for ClipboardSettings {
@@ -273,7 +347,7 @@ mod tests {
 
     #[test]
     fn automatic_swaps_only_between_mac_and_pc() {
-        let k = KeyboardSettings::default();
+        let k = PeerKeyboard::default();
         assert_eq!(k.remap(Key::LEFT_CTRL, Os::Linux, Os::MacOs), Key::LEFT_META);
         assert_eq!(k.remap(Key::RIGHT_META, Os::MacOs, Os::Windows), Key::RIGHT_CTRL);
         assert_eq!(k.remap(Key::LEFT_CTRL, Os::Linux, Os::Windows), Key::LEFT_CTRL);
@@ -282,11 +356,11 @@ mod tests {
 
     #[test]
     fn explicit_swaps() {
-        let k = KeyboardSettings { modifiers: ModifierMap::SwapAltMeta, ..Default::default() };
+        let k = PeerKeyboard { modifiers: ModifierMap::SwapAltMeta, ..Default::default() };
         assert_eq!(k.remap(Key::LEFT_ALT, Os::Linux, Os::Linux), Key::LEFT_META);
         assert_eq!(k.remap(Key::LEFT_META, Os::Linux, Os::Linux), Key::LEFT_ALT);
         assert_eq!(k.remap(Key::LEFT_CTRL, Os::Linux, Os::Linux), Key::LEFT_CTRL);
-        let k = KeyboardSettings { modifiers: ModifierMap::AsIs, ..Default::default() };
+        let k = PeerKeyboard { modifiers: ModifierMap::AsIs, ..Default::default() };
         assert_eq!(k.remap(Key::LEFT_CTRL, Os::Linux, Os::MacOs), Key::LEFT_CTRL);
     }
 }
