@@ -283,6 +283,8 @@ struct Engine {
     pending_switch: Option<PendingSwitch>,
     /// While controlling: packets received from the target, and when that last changed.
     heard: Option<(u64, Instant)>,
+    /// Last time captured input with no target was handed back.
+    rescued: Option<Instant>,
     /// The edges to watch changed while we controlled another device; apply
     /// them once the pointer is back.
     sides_stale: bool,
@@ -400,6 +402,7 @@ async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: mpsc::Unbou
         starting_injector: false,
         pending_switch: None,
         heard: None,
+        rescued: None,
         sides_stale: false,
         sides: Vec::new(),
         pairing: None,
@@ -1652,7 +1655,19 @@ impl Engine {
         match event {
             CaptureEvent::Activated { x, y } => self.activated(x, y),
             CaptureEvent::Input(input) if matches!(self.mode, Mode::Controlling(_)) => self.forward(input),
-            CaptureEvent::Input(_) => {}
+            CaptureEvent::Input(_) => {
+                // Captured with nowhere to send it: the mouse and keyboard
+                // would be dead here. Give them back right away.
+                if self.rescued.is_some_and(|at| at.elapsed() < Duration::from_millis(500)) {
+                    return;
+                }
+                self.rescued = Some(Instant::now());
+                tracing::warn!("input captured while not controlling a device; releasing it");
+                let p = self.home_point(self.pointer);
+                if let Some(c) = &self.capture {
+                    c.release(p.0, p.1);
+                }
+            }
             CaptureEvent::Deactivated => {
                 if let Mode::Controlling(t) = self.mode.clone() {
                     self.send_to(&t, Message::Leave);
