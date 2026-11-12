@@ -152,6 +152,8 @@ async fn run(
 
     let mut enabled = false;
     let mut activation_id = None;
+    // Where capture last activated, while it is active (cursor hidden).
+    let mut active: Option<(f32, f32)> = None;
     let emit = |e: Captured| {
         let _ = events.send(CaptureEvent::Input(e));
     };
@@ -165,11 +167,20 @@ async fn run(
                     enabled = true;
                 }
                 Some(CaptureCommand::Disable) if enabled => {
+                    // Disabling alone can leave an active capture holding the
+                    // pointer hidden: release it first.
+                    if let Some((x, y)) = active.take() {
+                        let options = ReleaseOptions::default()
+                            .set_activation_id(activation_id)
+                            .set_cursor_position(Some((x as f64, y as f64)));
+                        proxy.release(&session, options).await?;
+                    }
                     proxy.disable(&session, DisableOptions::default()).await?;
                     enabled = false;
                 }
                 Some(CaptureCommand::Enable | CaptureCommand::Disable) => {}
                 Some(CaptureCommand::Release { x, y }) => {
+                    active = None;
                     let options = ReleaseOptions::default()
                         .set_activation_id(activation_id)
                         .set_cursor_position(Some((x as f64, y as f64)));
@@ -183,9 +194,21 @@ async fn run(
             Some(signal) = activated.next() => {
                 activation_id = signal.activation_id();
                 let (x, y) = signal.cursor_position().unwrap_or_default();
+                if !enabled {
+                    // Raced with a Disable (for example the peer just took
+                    // control and moved our pointer onto the edge): give the
+                    // pointer straight back instead of hiding it.
+                    let options = ReleaseOptions::default()
+                        .set_activation_id(activation_id)
+                        .set_cursor_position(Some((x as f64, y as f64)));
+                    proxy.release(&session, options).await?;
+                    continue;
+                }
+                active = Some((x, y));
                 let _ = events.send(CaptureEvent::Activated { x, y });
             }
             Some(_) = deactivated.next() => {
+                active = None;
                 let _ = events.send(CaptureEvent::Deactivated);
             }
             Some(_) = disabled.next() => {

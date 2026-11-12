@@ -1673,6 +1673,17 @@ impl Engine {
     // ── Sending side ────────────────────────────────────────────────────
 
     fn captured(&mut self, event: CaptureEvent) {
+        // The other device drives our pointer, and it touched our edge before
+        // capture was switched off: never take the pointer (it would stay
+        // hidden). Hand it straight back.
+        if self.mode == Mode::Controlled
+            && let CaptureEvent::Activated { x, y } | CaptureEvent::DragOut { x, y, .. } = event
+        {
+            if let Some(c) = &self.capture {
+                c.release(x, y);
+            }
+            return;
+        }
         if self.pending_switch.is_some() {
             return self.while_pending(event);
         }
