@@ -2,7 +2,7 @@ use dextr_core::{
     PairingState,
     edge::Link,
     Mode,
-    settings::{Appearance, FrameRate, ModifierMap, ReturnShortcut},
+    settings::{Appearance, ModifierMap, ReturnShortcut},
 };
 use dextr_proto::{DEFAULT_PORT, Os, Rect, Side};
 use iced::{
@@ -205,7 +205,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
         Page::Pairing => pairing(app),
         Page::Mouse => mouse(app),
         Page::Keyboard => keyboard(app),
-        Page::Windows => windows(app),
+        Page::Clipboard => clipboard(app),
         Page::Activity => activity(app),
         Page::Settings => settings(app),
     };
@@ -232,11 +232,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
 
 fn sidebar(app: &App) -> Element<'_, Message> {
     let nav = column(Page::ALL.iter().map(|&p| {
-        let label: Element<'_, Message> = if p == Page::Windows {
-            row![text(p.label()).size(14), space::horizontal(), text("Beta").size(11)].align_y(Alignment::Center).into()
-        } else {
-            text(p.label()).size(14).into()
-        };
+        let label: Element<'_, Message> = text(p.label()).size(14).into();
         button(label)
             .width(Length::Fill)
             .padding([8, 12])
@@ -767,112 +763,38 @@ fn keyboard(app: &App) -> Element<'_, Message> {
 
 // ── Windows ──────────────────────────────────────────────────────────────
 
-fn windows(app: &App) -> Element<'_, Message> {
-    let w = &app.config().windows;
-    let connected = app.peer.is_some();
-    let can_share = connected && w.enabled;
-
-    // Share a window: the OS picker on Linux, a list on macOS.
-    let mut share = column![muted(
-        "The window opens on the other device as a real window of its own, pixel for pixel. Click and type in it there; it stays on this device too."
-    )
-    .size(13)]
-    .spacing(12);
-    match &app.shareable {
-        Some(list) => {
-            share = share.push(row![
-                text("Windows on this device").size(14).width(Length::Fill),
-                button("Refresh").style(button::secondary).on_press(Message::ListWindows),
-            ]
-            .align_y(Alignment::Center));
-            for win in list {
-                share = share.push(
-                    row![
-                        column![text(win.title.as_str()).size(14), muted(win.app.as_str()).size(12)].spacing(2).width(Length::Fill),
-                        button("Share").style(button::primary).on_press_maybe(can_share.then_some(Message::ShareWindow(Some(win.id)))),
-                    ]
-                    .spacing(12)
-                    .align_y(Alignment::Center),
-                );
-            }
-        }
-        None => {
-            share = share.push(row![
-                space::horizontal(),
-                button("Choose a window…").style(button::primary).on_press_maybe(can_share.then_some(Message::ShareWindow(None))),
-            ]);
-        }
-    }
-    if !connected {
-        share = share.push(muted("Connect to your other device first.").size(12));
-    } else if !w.enabled {
-        share = share.push(muted("Window sharing is turned off below.").size(12));
-    }
-    if let Some(e) = &app.share_error {
-        share = share.push(banner(text(e.as_str()).size(13), Tone::Bad));
-    }
-
-    let mut page = column![heading("Windows", "Show a window from this device on the other one."), card("Share a window", share)].spacing(16);
-
-    if !app.sharing.is_empty() {
-        page = page.push(card(
-            "Shared now",
-            column(app.sharing.iter().map(|s| {
-                let note = if s.interactive { "Mouse and keyboard work on it" } else { "View only: its position on screen is unknown" };
-                row![
-                    column![text(s.title.as_str()).size(14), muted(note).size(12)].spacing(2).width(Length::Fill),
-                    button("Stop").style(button::secondary).on_press(Message::StopSharing(s.id)),
-                ]
-                .spacing(12)
-                .align_y(Alignment::Center)
-                .into()
-            }))
-            .spacing(12),
-        ));
-    }
-    if !app.remotes.is_empty() {
-        page = page.push(card(
-            "From the other device",
-            column(app.remotes.values().map(|r| {
-                let (pw, ph) = r.surface.size();
-                row![text(r.title.as_str()).size(14).width(Length::Fill), muted(format!("{pw} × {ph}")).size(12)]
-                    .spacing(12)
-                    .align_y(Alignment::Center)
-                    .into()
-            }))
-            .spacing(10),
-        ));
-    }
-
-    page.push(card(
-        "Settings",
+fn clipboard(app: &App) -> Element<'_, Message> {
+    let c = &app.config().clipboard;
+    let settings = card(
+        "Clipboard",
         settings_list(vec![
-            switch("Window sharing", "Share windows with the other device, in both directions.", w.enabled, Setting::WindowsEnabled),
             switch(
-                "Accept windows from the other device",
-                "Let the other device open its windows here.",
-                w.accept_incoming,
-                Setting::WindowsAcceptIncoming,
+                "Share the clipboard",
+                "Copy on one device, paste on the other. Applies in both directions.",
+                c.enabled,
+                Setting::ClipboardEnabled,
             ),
-            choose(
-                "Frame rate",
-                "Upper limit on updates. Only the parts that change are sent, without any loss of quality.",
-                FrameRate::ALL,
-                w.frame_rate,
-                Setting::FrameRate,
+            switch("Include images", "Screenshots and copied pictures go across too.", c.images, Setting::ClipboardImages),
+            slide(
+                "Largest copy",
+                "Bigger copies stay on the device they were made on.",
+                1.0..=256.0,
+                1.0,
+                c.max_mb as f32,
+                format!("{} MB", c.max_mb),
+                |v| Setting::ClipboardMaxMb(v as u32),
             ),
         ]),
-    ))
-    .push(card(
+    );
+    let notes = card(
         "Good to know",
         column![
-            muted("On Linux, the desktop asks which window to share each time. On KDE Plasma, dextr also finds the window on screen, so clicks and typing from the other device reach it; elsewhere it's shared view-only.").size(12),
-            muted("From a Mac: drag a window past the shared edge to send it across. It opens under the pointer on the other device and hides on the Mac; close it there to bring it back. Turn off “Tile by dragging windows to screen edges” (System Settings › Desktop & Dock) if macOS snaps it instead.").size(12),
-            muted("Dragging from Linux to the Mac isn't supported yet: use Choose a window….").size(12),
+            muted("Whatever you copy is sent to the other device right away over the encrypted connection, so it's ready to paste wherever the pointer is.").size(12),
+            muted("Text and images are supported. Files aren't yet.").size(12),
         ]
         .spacing(6),
-    ))
-    .into()
+    );
+    column![heading("Clipboard", "Copy on one device, paste on the other."), settings, notes].spacing(16).into()
 }
 
 // ── Activity ─────────────────────────────────────────────────────────────
@@ -996,7 +918,7 @@ fn settings(app: &App) -> Element<'_, Message> {
 
     let about = card(
         "About",
-        column![text(format!("dextr {}", env!("CARGO_PKG_VERSION"))).size(14), muted("Mouse, keyboard and window sharing between your computers.")]
+        column![text(format!("dextr {}", env!("CARGO_PKG_VERSION"))).size(14), muted("One mouse, keyboard and clipboard across your computers.")]
             .spacing(6),
     );
 

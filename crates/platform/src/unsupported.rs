@@ -32,14 +32,3 @@ pub(crate) fn spawn_injector(
     Ok(())
 }
 
-pub(crate) async fn shareable_windows() -> anyhow::Result<Option<Vec<crate::window::ShareableWindow>>> {
-    Err(anyhow::anyhow!("window sharing is not implemented on this OS yet"))
-}
-
-pub(crate) async fn place_own_window(_title: &str, _x: f32, _y: f32) -> bool {
-    false
-}
-
-pub(crate) async fn capture_window(_id: Option<u64>, _park: bool) -> anyhow::Result<crate::window::WindowCapture> {
-    Err(anyhow::anyhow!("window sharing is not implemented on this OS yet"))
-}

@@ -5,7 +5,7 @@ use dextr_proto::{DEFAULT_PORT, Rect, Side};
 use serde::{Deserialize, Serialize};
 
 use crate::settings::{
-    Appearance, ConnectionSettings, KeyboardSettings, MouseSettings, SwitchingSettings, WindowSettings,
+    Appearance, ClipboardSettings, ConnectionSettings, KeyboardSettings, MouseSettings, SwitchingSettings,
 };
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -38,7 +38,7 @@ pub struct Config {
     pub switching: SwitchingSettings,
     pub mouse: MouseSettings,
     pub keyboard: KeyboardSettings,
-    pub windows: WindowSettings,
+    pub clipboard: ClipboardSettings,
     pub appearance: Appearance,
 }
 
@@ -59,7 +59,7 @@ impl Default for Config {
             switching: SwitchingSettings::default(),
             mouse: MouseSettings::default(),
             keyboard: KeyboardSettings::default(),
-            windows: WindowSettings::default(),
+            clipboard: ClipboardSettings::default(),
             appearance: Appearance::default(),
         }
     }

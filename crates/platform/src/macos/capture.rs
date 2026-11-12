@@ -39,17 +39,10 @@ struct State {
     /// Our screens whose `side` edge is on the outside of the layout.
     edges: Vec<Rect>,
     cursor_hidden: bool,
-    /// The window under the pointer since the left button went down.
-    drag: Option<Drag>,
-}
-
-/// A possible window drag: the window under the pointer when the button
-/// went down and where it was.
-struct Drag {
-    window: u32,
-    origin: CGPoint,
-    /// The pointer relative to the window's top-left.
-    grab: (f64, f64),
+    /// Keys held on this Mac (macOS keycodes). If one is still held when
+    /// the pointer crosses, its release must reach this Mac, not the peer,
+    /// or macOS keeps it pressed.
+    held: Vec<u16>,
 }
 
 impl State {
@@ -140,7 +133,7 @@ pub(crate) fn spawn_capture(
 ) -> anyhow::Result<()> {
     let mut known = screens();
     screens_tx.send_replace(known.clone());
-    let mut state = State { enabled: false, captured: false, armed: true, side, edges: Vec::new(), cursor_hidden: false, drag: None };
+    let mut state = State { enabled: false, captured: false, armed: true, side, edges: Vec::new(), cursor_hidden: false, held: Vec::new() };
     state.set_layout(side, &known);
     let shared = Arc::new(Shared {
         events,
@@ -258,7 +251,7 @@ unsafe extern "C" fn callback(_proxy: CGEventTapProxy, kind: CGEventType, event:
             }
             return event;
         }
-        // Our own injected input (window input from the other device):
+        // Our own injected input (when the other device controls this Mac):
         // never treat it as the user's hand. The tag can be lost on the way
         // through the HID layer, the posting process ID can't.
         if CGEventGetIntegerValueField(event, FIELD_SOURCE_USER_DATA) == DEXTR_EVENT
@@ -272,28 +265,16 @@ unsafe extern "C" fn callback(_proxy: CGEventTapProxy, kind: CGEventType, event:
         return event;
     }
 
+    // Track keys held here (see `State::held`).
+    let key = key_change(kind, event);
     if !st.captured {
-        match kind {
-            LEFT_DOWN => {
-                let p = unsafe { CGEventGetLocation(event) };
-                let id = unsafe { CGEventGetIntegerValueField(event, FIELD_WINDOW_UNDER_POINTER) } as u32;
-                let info = if id != 0 { super::window::window_info(id) } else { None };
-                st.drag = info.or_else(|| super::window::window_at(p)).filter(|w| w.is_app_window()).map(|w| {
-                    let o = w.origin();
-                    Drag { window: w.id, origin: o, grab: (p.x - o.x, p.y - o.y) }
-                });
-            }
-            LEFT_UP => st.drag = None,
-            LEFT_DRAGGED => {
-                if let Some(out) = drag_out(&mut st, event) {
-                    let _ = shared.events.send(out);
-                    return ptr::null_mut();
-                }
-            }
+        match key {
+            Some((code, true)) if !st.held.contains(&code) => st.held.push(code),
+            Some((code, false)) => st.held.retain(|&k| k != code),
             _ => {}
         }
-        // Plain moves switch; crossing while dragging anything but a window
-        // would leave the button held here.
+        // Only plain moves switch: crossing while dragging would leave the
+        // button held here.
         if kind == MOUSE_MOVED {
             let (p, dx, dy) = unsafe {
                 (
@@ -315,6 +296,14 @@ unsafe extern "C" fn callback(_proxy: CGEventTapProxy, kind: CGEventType, event:
         return event;
     }
 
+    // The release of a key pressed before crossing belongs to this Mac.
+    if let Some((code, false)) = key
+        && st.held.contains(&code)
+    {
+        st.held.retain(|&k| k != code);
+        return event;
+    }
+
     // Captured: report everything, deliver nothing locally.
     let send = |input: Captured| {
         let _ = shared.events.send(CaptureEvent::Input(input));
@@ -323,46 +312,33 @@ unsafe extern "C" fn callback(_proxy: CGEventTapProxy, kind: CGEventType, event:
     ptr::null_mut()
 }
 
-/// A window being dragged past the edge facing the peer: take over the
-/// pointer, end the drag here, and report which window goes along.
-fn drag_out(st: &mut State, event: CGEventRef) -> Option<CaptureEvent> {
-    let (p, dx, dy) = unsafe {
-        (
-            CGEventGetLocation(event),
-            CGEventGetDoubleValueField(event, FIELD_DELTA_X),
-            CGEventGetDoubleValueField(event, FIELD_DELTA_Y),
-        )
-    };
-    let drag = st.drag.as_ref()?;
-    if !st.armed || !st.pushing_edge(p, dx, dy) {
-        return None;
-    }
-    // Only if the window itself is moving (not selecting text, say).
-    let now = super::window::window_info(drag.window)?.origin();
-    if (now.x - drag.origin.x).abs() < 1.0 && (now.y - drag.origin.y).abs() < 1.0 {
-        return None;
-    }
-    let (window, grab) = (drag.window, drag.grab);
-    st.drag = None;
-    st.grab();
-    // End the drag on this Mac a little away from the edge, so macOS doesn't
-    // tile the window into half the screen.
-    let inward = 60.0;
-    let at = match st.side {
-        Side::Right => CGPoint { x: p.x - inward, y: p.y },
-        Side::Left => CGPoint { x: p.x + inward, y: p.y },
-        Side::Bottom => CGPoint { x: p.x, y: p.y - inward },
-        Side::Top => CGPoint { x: p.x, y: p.y + inward },
-    };
-    unsafe {
-        let up = CGEventCreateMouseEvent(ptr::null_mut(), LEFT_UP, at, 0);
-        if !up.is_null() {
-            CGEventSetIntegerValueField(up, FIELD_SOURCE_USER_DATA, DEXTR_EVENT);
-            CGEventPost(HID_EVENT_TAP, up);
-            CFRelease(up);
+/// A key press or release (macOS keycode, pressed), including modifiers.
+fn key_change(kind: CGEventType, event: CGEventRef) -> Option<(u16, bool)> {
+    let code = || unsafe { CGEventGetIntegerValueField(event, FIELD_KEYCODE) } as u16;
+    match kind {
+        KEY_DOWN => Some((code(), true)),
+        KEY_UP => Some((code(), false)),
+        FLAGS_CHANGED => {
+            let code = code();
+            modifier_bit(code).map(|bit| (code, unsafe { CGEventGetFlags(event) } & bit != 0))
         }
+        _ => None,
     }
-    Some(CaptureEvent::DragOut { x: p.x as f32, y: p.y as f32, window: window as u64, grab: (grab.0 as f32, grab.1 as f32) })
+}
+
+/// The left/right-specific flag bit of a modifier key.
+fn modifier_bit(code: u16) -> Option<u64> {
+    Some(match code {
+        0x3B => DEV_LCTRL,
+        0x3E => DEV_RCTRL,
+        0x38 => DEV_LSHIFT,
+        0x3C => DEV_RSHIFT,
+        0x3A => DEV_LALT,
+        0x3D => DEV_RALT,
+        0x37 => DEV_LCMD,
+        0x36 => DEV_RCMD,
+        _ => return None,
+    })
 }
 
 unsafe fn translate(kind: CGEventType, event: CGEventRef, send: impl Fn(Captured)) {
@@ -419,18 +395,8 @@ unsafe fn translate(kind: CGEventType, event: CGEventRef, send: impl Fn(Captured
                 send(Captured::Key { key, pressed: false });
                 return;
             }
-            let held = match code {
-                0x3B => DEV_LCTRL,
-                0x3E => DEV_RCTRL,
-                0x38 => DEV_LSHIFT,
-                0x3C => DEV_RSHIFT,
-                0x3A => DEV_LALT,
-                0x3D => DEV_RALT,
-                0x37 => DEV_LCMD,
-                0x36 => DEV_RCMD,
-                _ => return,
-            };
-            send(Captured::Key { key, pressed: flags & held != 0 });
+            let Some(bit) = modifier_bit(code) else { return };
+            send(Captured::Key { key, pressed: flags & bit != 0 });
         }
         _ => {}
     }

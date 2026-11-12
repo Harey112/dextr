@@ -1,14 +1,14 @@
 # dextr
 
-Share one mouse and keyboard between computers, in any direction, written in Rust.
+Share one mouse, keyboard and clipboard between computers, in any direction, written in Rust.
 
 ## Layout
 
 | Crate | Job |
 |---|---|
 | `crates/proto` | Wire protocol: messages, HID key codes, screen geometry. Same on every OS. |
-| `crates/platform` | OS backends behind one interface: input **capture** and input **injection**. |
-| `crates/core` | Engine: QUIC transport, discovery, pairing by code, pointer hand-off. |
+| `crates/platform` | OS backends behind one interface: input **capture**, input **injection**, the **clipboard**. |
+| `crates/core` | Engine: QUIC transport, discovery, pairing by code, pointer hand-off, clipboard sync. |
 | `crates/app` | iced desktop app (`dextr` binary): settings, pairing, status. |
 
 ## Status
@@ -18,9 +18,7 @@ Share one mouse and keyboard between computers, in any direction, written in Rus
 | Control the peer (capture) | ✅ InputCapture portal + libei | 🧪 Quartz event tap | ⏳ Raw Input + hook |
 | Be controlled (inject) | ✅ RemoteDesktop portal + libei | 🧪 CGEventPost | ⏳ SendInput |
 | Launch at login | ✅ autostart entry | 🧪 LaunchAgent | ⏳ |
-| Share a window (send) | ✅ ScreenCast portal + PipeWire; input on KDE Plasma | 🧪 ScreenCaptureKit | ⏳ |
-| Drag a window across the edge | ⏳ | 🧪 sends the window, parks the original | ⏳ |
-| Show a shared window (receive) | ✅ | ✅ (same iced code) | ⏳ |
+| Clipboard (text, images) | ✅ Wayland data-control (KDE Plasma, wlroots) | 🧪 NSPasteboard | ⏳ |
 
 ✅ works · 🧪 written, compiles for macOS, not yet tested on a Mac · ⏳ not started
 
@@ -91,39 +89,19 @@ Discovery broadcasts carry only a name, OS, port and fingerprint.
 Settings and the device certificate live in `~/.config/dextr/` on Linux and
 `~/Library/Application Support/dev.dextr.dextr/` on macOS.
 
-## Window sharing
+## Clipboard
 
-On the **Windows** page, press **Choose a window…** (Linux: the desktop's own picker) or pick one
-from the list (macOS). It opens on the other device as a real native window, with that device's own
-title bar and taskbar entry. Mouse, scrolling and keyboard in it go back to the original window.
+Copy on one device, paste on the other: text and images (as PNG), in both directions. Each copy is
+sent once, right away, over the encrypted connection, on a QUIC stream of its own so a large image
+never holds up the mouse or keyboard. Images are compared by their pixels, so a picture re-encoded
+by the other OS isn't sent back. Turn it off, leave images out, or cap the size on the **Clipboard**
+page.
 
-* **Pixel for pixel.** The window is captured at its real resolution (Retina too), and the receiving
-  window is sized so one of its pixels is one screen pixel, drawn without smoothing. Nothing is
-  scaled or video-compressed, so text is exactly as sharp as on the original.
-* **Only what changes is sent.** Frames are compared in 64×64 tiles and only changed tiles go over the
-  network, LZ4-compressed. A still window costs nothing. If the network is slower than the window
-  changes, frames are skipped, never queued, so it never lags behind.
-* **Linux:** no extra packages are needed (PipeWire is loaded at runtime). On KDE Plasma, a small KWin
-  script tells dextr where the window is, so input reaches it; on other desktops it's view-only.
-* **macOS:** captured with ScreenCaptureKit (macOS 12.3+), which keeps capturing a window even when
-  it's covered or off-screen. Needs **Screen Recording** permission (System Settings → Privacy &
-  Security); macOS asks again about once a month.
-
-### Dragging a window across (from a Mac)
-
-Drag a Mac window past the shared edge. The pointer moves to the other device and the window comes
-with it, opening under the pointer at the spot you were holding. On the Mac, the real window is moved
-out of sight (to the bottom-right corner) and keeps being captured there with ScreenCaptureKit. When
-you click or type in it from the other device, it comes back on the Mac for a moment so the input
-lands, then hides again. Close it on the other device (or press **Stop** on the Mac) and it returns to
-where it was.
-
-* Needs **Accessibility** (to move the window) and **Screen Recording** (to capture it).
-* macOS 15+ tiles windows dragged to the left or right edge. If that gets in the way, turn off
-  **Tile by dragging windows to screen edges** in System Settings › Desktop & Dock.
-* Dragging from Linux to the Mac isn't supported yet; share Linux windows with **Choose a window…**.
-
-Windows shared with **Choose a window…** stay on their own device too.
+* **Linux:** works in the background through the Wayland data-control protocol (KDE Plasma, wlroots
+  desktops). Text is checked a few times a second; images about once a second, compared as the raw
+  PNG bytes and decoded only when they change.
+* **macOS:** the pasteboard's change counter is checked a few times a second, and the contents are
+  read only when it changes.
 
 ## How hand-off works
 

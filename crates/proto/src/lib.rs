@@ -16,7 +16,7 @@ pub use keys::Key;
 use serde::{Deserialize, Serialize};
 
 /// Bumped on every incompatible change to [`Message`].
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// ALPN identifier negotiated on the QUIC connection.
 pub const ALPN: &[u8] = b"dextr/1";
@@ -112,67 +112,26 @@ pub enum Message {
     PairAccept,
     /// The sender's user declined or cancelled.
     PairReject,
-    /// The sender starts sharing one of its windows. Its pixels follow on a
-    /// unidirectional stream that starts with [`WindowStream::Start`].
-    WindowOpen(WindowInfo),
-    /// Sender → receiver: this shared window is gone.
-    WindowClose { id: u32 },
-    /// Receiver → sender: the user closed the shared window here.
-    WindowDismiss { id: u32 },
     /// Where the receiver sits next to the sender's screens: on `side` of
     /// them, its edge starting `offset` pixels along theirs (`None`:
     /// centered). The receiver mirrors it if `changed_at` (Unix ms) is newer
     /// than its own arrangement.
     Arrangement { side: Side, offset: Option<i32>, changed_at: u64 },
-    /// Receiver → sender: input on a shared window. Positions are in the
-    /// window's own pixels, from its top-left corner.
-    WindowInput { id: u32, input: Input },
 }
 
-/// A window shared by the sender.
+/// Clipboard contents, sent on a unidirectional stream of its own (it can
+/// be large) as one length-prefixed [`Clipboard`] message.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct WindowInfo {
-    pub id: u32,
-    pub title: String,
-    pub app: String,
-    pub width: u32,
-    pub height: u32,
-    /// The sender's pixels per logical unit (2 on a Retina Mac).
-    pub scale: f32,
-    /// The window was dragged across: the pointer holds it at this point
-    /// (window pixels from its top-left), so place it under the pointer.
-    pub grab: Option<(f32, f32)>,
+pub enum Clipboard {
+    Text(String),
+    /// A PNG image.
+    Image { png: Vec<u8> },
 }
 
-/// Messages on a window's unidirectional stream.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub enum WindowStream {
-    Start { id: u32 },
-    Frame(FrameUpdate),
-}
+/// Largest clipboard message accepted.
+pub const MAX_CLIPBOARD: usize = 256 * 1024 * 1024;
 
-/// The parts of a window that changed. Lossless: tiles are BGRA pixels,
-/// LZ4-compressed.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct FrameUpdate {
-    pub width: u32,
-    pub height: u32,
-    pub tiles: Vec<Tile>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct Tile {
-    pub x: u32,
-    pub y: u32,
-    pub w: u32,
-    pub h: u32,
-    pub data: Vec<u8>,
-}
-
-/// Largest frame accepted on a window stream.
-pub const MAX_WINDOW_FRAME: usize = 128 * 1024 * 1024;
-
-impl WindowStream {
+impl Clipboard {
     pub fn to_frame(&self) -> Result<Vec<u8>, CodecError> {
         let payload = postcard::to_stdvec(self)?;
         let mut out = Vec::with_capacity(4 + payload.len());

@@ -11,11 +11,9 @@ pub mod discovery;
 pub mod edge;
 pub mod identity;
 pub mod settings;
-pub mod window;
 mod engine;
 mod tls;
 
 pub use config::Config;
 pub use discovery::LocalAddress;
-pub use dextr_platform::window::{ShareableWindow, place_own_window};
-pub use engine::{Command, Event, Mode, Nearby, PairingState, SharedWindow, spawn};
+pub use engine::{Command, Event, Mode, Nearby, PairingState, spawn};

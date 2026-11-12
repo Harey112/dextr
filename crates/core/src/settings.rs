@@ -162,32 +162,23 @@ impl KeyboardSettings {
     }
 }
 
-// ── Windows ──────────────────────────────────────────────────────────
+// ── Clipboard ────────────────────────────────────────────────────────
 
-choice!(
-    /// Upper limit on how often a shared window is updated.
-    FrameRate {
-        Match => "As fast as it changes",
-        Fps30 => "30 fps",
-        Fps60 => "60 fps",
-        Fps120 => "120 fps",
-    } default Match
-);
-
-/// Sharing windows with the other device.
+/// Sharing the clipboard with the other device.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
-pub struct WindowSettings {
-    /// Window sharing at all, in either direction.
+pub struct ClipboardSettings {
+    /// Copy on one device, paste on the other.
     pub enabled: bool,
-    /// Let the other device show its windows here.
-    pub accept_incoming: bool,
-    pub frame_rate: FrameRate,
+    /// Also share copied images.
+    pub images: bool,
+    /// Larger copies aren't shared, in megabytes.
+    pub max_mb: u32,
 }
 
-impl Default for WindowSettings {
+impl Default for ClipboardSettings {
     fn default() -> Self {
-        Self { enabled: true, accept_incoming: true, frame_rate: FrameRate::Match }
+        Self { enabled: true, images: true, max_mb: 32 }
     }
 }
 

@@ -8,11 +8,10 @@ use std::{
 use anyhow::{Context as _, bail};
 use dextr_platform::{
     CaptureEvent, CaptureHandle, Captured, InjectorHandle,
-    window::{self as capture_window, ShareableWindow, WindowCapture, WindowGeometry},
+    clipboard::{self, ClipContent, ClipboardHandle},
 };
 use dextr_proto::{
-    Beacon, Button, DEFAULT_PORT, Hello, Input, Key, MAX_FRAME, MAX_WINDOW_FRAME, Message, Os, PROTOCOL_VERSION, Rect, Side, WindowInfo,
-    WindowStream,
+    Beacon, Button, Clipboard, DEFAULT_PORT, Hello, Input, Key, MAX_CLIPBOARD, MAX_FRAME, Message, Os, PROTOCOL_VERSION, Rect, Side,
 };
 use tokio::{
     sync::{mpsc, watch},
@@ -24,9 +23,7 @@ use crate::{
     discovery::{self, LocalAddress},
     edge::{self, Link},
     identity::{self, Fingerprint, Identity},
-    settings::FrameRate,
     tls,
-    window::{Encoder, Frame, Surface},
 };
 
 /// The paired device's fingerprint, if any.
@@ -61,27 +58,6 @@ pub enum Command {
     Pair(String),
     /// The user confirmed (true) or declined/cancelled (false) the pairing.
     PairDecision(bool),
-    /// List the windows that can be shared without the OS picker.
-    ListWindows,
-    /// Share a window from [`Event::ShareableWindows`], or pick one with the
-    /// OS's dialog (`None`).
-    ShareWindow(Option<u64>),
-    /// Stop sharing one of our windows.
-    StopSharing(u32),
-    /// The user closed a window shared by the other device.
-    CloseWindow(u32),
-    /// Input on a window shared by the other device, in its pixels.
-    WindowInput { id: u32, input: Input },
-}
-
-/// One of our windows being shared.
-#[derive(Debug, Clone, PartialEq)]
-pub struct SharedWindow {
-    pub id: u32,
-    pub title: String,
-    pub app: String,
-    /// Input from the other device can reach it (its position is known).
-    pub interactive: bool,
 }
 
 /// Another dextr device on the local network.
@@ -150,21 +126,6 @@ pub enum Event {
     Nearby(Vec<Nearby>),
     /// This device's network addresses.
     Addresses(Vec<LocalAddress>),
-    /// Windows that can be shared, or `None` when the OS shows its own picker.
-    ShareableWindows(Option<Vec<ShareableWindow>>),
-    /// Our windows being shared now.
-    Sharing(Vec<SharedWindow>),
-    /// Why a window couldn't be shared.
-    ShareFailed(String),
-    /// The other device shares a window: show it.
-    /// `pointer` is where our pointer is (for a window dragged across).
-    WindowOpened { info: WindowInfo, from: String, surface: Arc<Surface>, pointer: Option<(f32, f32)> },
-    /// New pixels for a shared window.
-    WindowFrame { id: u32 },
-    /// A shared window changed size.
-    WindowResized { id: u32, width: u32, height: u32 },
-    /// A shared window is gone.
-    WindowClosed { id: u32 },
     Log(String),
 }
 
@@ -175,11 +136,10 @@ pub fn spawn() -> (mpsc::UnboundedSender<Command>, mpsc::UnboundedReceiver<Event
     std::thread::Builder::new()
         .name("dextr-core".into())
         .spawn(move || {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .thread_name("dextr-net")
-                .enable_all()
-                .build();
+            // One thread for the whole engine: input passes from capture to
+            // the network without hopping between threads. OS backends and
+            // the clipboard run on threads of their own.
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build();
             match runtime {
                 Ok(rt) => rt.block_on(run(cmd_rx, event_tx)),
                 Err(e) => {
@@ -204,12 +164,9 @@ enum Internal {
     PairPeerAccepted { id: u64 },
     PairEnded { id: u64, reason: String },
     Paired { id: u64, est: Established },
-    /// A window capture started; `grab` if it was dragged across.
-    ShareReady { result: anyhow::Result<WindowCapture>, grab: Option<(f32, f32)> },
-    ShareOpened { session: u64, info: WindowInfo },
-    ShareEnded { id: u32, reason: String },
-    WindowFrame { session: u64, id: u32, resized: bool },
     Inbound { session: u64, message: Message },
+    /// The other device copied something.
+    Clipboard { session: u64, content: Clipboard },
     SessionClosed { session: u64, reason: String },
 }
 
@@ -248,21 +205,6 @@ struct Pairing {
     decide: Option<mpsc::UnboundedSender<bool>>,
 }
 
-/// One of our windows being shared.
-struct Share {
-    title: String,
-    app: String,
-    geometry: watch::Receiver<Option<WindowGeometry>>,
-    /// Brings a parked window back before input is injected.
-    input: dextr_platform::window::InputHandle,
-    /// The latest frame size, in pixels.
-    size: Arc<std::sync::Mutex<(u32, u32)>>,
-    task: tokio::task::JoinHandle<()>,
-}
-
-/// Windows shared by the other device, by id; written by the stream readers.
-type Surfaces = Arc<std::sync::Mutex<HashMap<u32, Arc<Surface>>>>;
-
 struct Session {
     id: u64,
     dialed: bool,
@@ -297,21 +239,12 @@ struct Engine {
     connecting: bool,
     /// Pointer is pushing against the edge, waiting for the switch delay.
     pending_switch: Option<PendingSwitch>,
-    /// A window was dragged across: the user's eventual button release
-    /// belongs to the drag that already ended here, so don't send it.
-    swallow_release: bool,
-    /// Where the other device last put our pointer while controlling us.
-    pointer_here: (f32, f32),
     pairing: Option<Pairing>,
     next_pairing: u64,
     nearby: HashMap<Fingerprint, (Nearby, Instant)>,
     beacon: watch::Sender<Beacon>,
     addresses: Vec<LocalAddress>,
-    shares: HashMap<u32, Share>,
-    next_share: u32,
-    surfaces: Surfaces,
-    /// Windows shared by the other device that the UI shows.
-    incoming: HashMap<u32, WindowInfo>,
+    clipboard: Option<ClipboardHandle>,
 }
 
 struct PendingSwitch {
@@ -381,6 +314,15 @@ async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: mpsc::Unbou
     let _ = events.send(Event::Addresses(addresses.clone()));
     let mut housekeeping = tokio::time::interval(Duration::from_secs(2));
 
+    let (clip_tx, mut clip_rx) = mpsc::unbounded_channel();
+    let clipboard = match clipboard::start_clipboard(clip_tx) {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            log(format!("Clipboard sharing is unavailable: {e:#}"));
+            None
+        }
+    };
+
     let mut engine = Engine {
         config,
         identity,
@@ -404,17 +346,12 @@ async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: mpsc::Unbou
         reconnect_delay: RECONNECT_MIN,
         connecting: false,
         pending_switch: None,
-        swallow_release: false,
-        pointer_here: (0.0, 0.0),
         pairing: None,
         next_pairing: 0,
         nearby: HashMap::new(),
         beacon,
         addresses,
-        shares: HashMap::new(),
-        next_share: 0,
-        surfaces: Arc::default(),
-        incoming: HashMap::new(),
+        clipboard,
     };
     engine.start_backends();
     if engine.config.connection.auto_connect && engine.peer_configured() {
@@ -502,6 +439,7 @@ async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: mpsc::Unbou
                 }
             }
             Some((beacon, from)) = found_rx.recv() => engine.on_beacon(beacon, from),
+            Some(content) = clip_rx.recv() => engine.local_clipboard(content),
             _ = housekeeping.tick() => engine.housekeeping(),
             note = injector_note(&mut injector_watch) => match note {
                 InjectorNote::Screens(screens) => {
@@ -689,127 +627,31 @@ async fn pair_conversation(link: PairLink, mut decisions: mpsc::UnboundedReceive
     }
 }
 
-/// Sends one window: waits for its first frame, announces it, then streams
-/// changed tiles, always encoding the newest frame so a slow network skips
-/// frames instead of falling behind.
-#[allow(clippy::too_many_arguments)]
-async fn stream_window(
-    conn: quinn::Connection,
-    session: u64,
-    id: u32,
-    mut capture: WindowCapture,
-    grab: Option<(f32, f32)>,
-    size: Arc<std::sync::Mutex<(u32, u32)>>,
-    min_interval: Duration,
-    tx: mpsc::UnboundedSender<Internal>,
-) {
-    let reason = async {
-        let first = loop {
-            if let Some(f) = capture.frames.borrow_and_update().clone() {
-                break f;
-            }
-            tokio::select! {
-                r = capture.frames.changed() => if r.is_err() { anyhow::bail!("the window closed") },
-                r = &mut capture.ended => anyhow::bail!(r.unwrap_or_else(|_| "capture ended".into())),
-            }
-        };
-        let scale = capture.geometry.borrow().map_or(1.0, |g| first.width as f32 / g.width.max(1.0));
-        let grab = grab.map(|(x, y)| (x * scale, y * scale));
-        let info = WindowInfo { id, title: capture.title.clone(), app: capture.app.clone(), width: first.width, height: first.height, scale, grab };
-        let _ = tx.send(Internal::ShareOpened { session, info });
-
-        let mut out = conn.open_uni().await?;
-        out.write_all(&WindowStream::Start { id }.to_frame()?).await?;
-        let mut encoder = Encoder::default();
-        let mut frame = first;
-        loop {
-            let sent_at = Instant::now();
-            *size.lock().unwrap() = (frame.width, frame.height);
-            let update = encoder.encode(&Frame { width: frame.width, height: frame.height, stride: frame.stride, data: &frame.data });
-            if let Some(update) = update {
-                out.write_all(&WindowStream::Frame(update).to_frame()?).await?;
-            }
-            tokio::time::sleep_until(sent_at + min_interval).await;
-            tokio::select! {
-                r = capture.frames.changed() => if r.is_err() { break },
-                r = &mut capture.ended => anyhow::bail!(r.unwrap_or_else(|_| "capture ended".into())),
-            }
-            let Some(next) = capture.frames.borrow_and_update().clone() else { continue };
-            frame = next;
-        }
-        anyhow::Ok(String::from("the window closed"))
-    }
-    .await
-    .unwrap_or_else(|e| format!("{e:#}"));
-    let _ = tx.send(Internal::ShareEnded { id, reason });
-}
-
-/// A moving test pattern instead of a real window (`DEXTR_TEST_WINDOW`), to
-/// test sharing without the OS's window picker.
-fn test_pattern() -> WindowCapture {
-    use dextr_platform::window::CapturedFrame;
-    let (w, h) = (640u32, 400u32);
-    let (frames_tx, frames) = watch::channel(None);
-    let (_geometry_tx, geometry) = watch::channel(None);
-    let (ended_tx, ended) = tokio::sync::oneshot::channel::<String>();
-    tokio::spawn(async move {
-        let _keep = (ended_tx, _geometry_tx);
-        let mut tick = tokio::time::interval(Duration::from_millis(33));
-        for n in 0u32.. {
-            tick.tick().await;
-            let mut data = vec![0u8; (w * h * 4) as usize];
-            for y in 0..h {
-                for x in 0..w {
-                    let i = ((y * w + x) * 4) as usize;
-                    // Stripes for sharpness, a sweeping bar for motion.
-                    let stripe = if (x / 2) % 2 == 0 { 230 } else { 30 };
-                    let bar = (x + n * 4) % w < 40;
-                    data[i..i + 4].copy_from_slice(&if bar { [40, 160, 240, 255] } else { [stripe, stripe, stripe, 255] });
-                }
-            }
-            if frames_tx.send(Some(Arc::new(CapturedFrame { width: w, height: h, stride: (w * 4) as usize, data }))).is_err() {
-                break;
-            }
-        }
-    });
-    WindowCapture::from_parts("Test pattern".into(), "dextr".into(), frames, geometry, ended)
-}
-
-/// Receives the other device's shared windows: one stream per window.
-async fn receive_windows(conn: quinn::Connection, session: u64, surfaces: Surfaces, tx: mpsc::UnboundedSender<Internal>) {
+/// Receives the other device's clipboard: each copy on a stream of its own.
+async fn receive_clipboard(conn: quinn::Connection, session: u64, tx: mpsc::UnboundedSender<Internal>) {
     while let Ok(mut stream) = conn.accept_uni().await {
-        let (surfaces, tx) = (surfaces.clone(), tx.clone());
+        let tx = tx.clone();
         tokio::spawn(async move {
-            let result = async {
-                let WindowStream::Start { id } = read_window_message(&mut stream).await? else {
-                    anyhow::bail!("window stream didn't start with its id");
-                };
-                loop {
-                    let WindowStream::Frame(update) = read_window_message(&mut stream).await? else { continue };
-                    let surface = surfaces.lock().unwrap().entry(id).or_default().clone();
-                    let resized = surface.apply(&update)?;
-                    let _ = tx.send(Internal::WindowFrame { session, id, resized });
+            match read_clipboard(&mut stream).await {
+                Ok(content) => {
+                    let _ = tx.send(Internal::Clipboard { session, content });
                 }
-                #[allow(unreachable_code)]
-                anyhow::Ok(())
-            };
-            if let Err(e) = result.await {
-                tracing::debug!("window stream ended: {e:#}");
+                Err(e) => tracing::debug!("clipboard not received: {e:#}"),
             }
         });
     }
 }
 
-async fn read_window_message(recv: &mut quinn::RecvStream) -> anyhow::Result<WindowStream> {
+async fn read_clipboard(recv: &mut quinn::RecvStream) -> anyhow::Result<Clipboard> {
     let mut len = [0u8; 4];
     recv.read_exact(&mut len).await?;
     let len = u32::from_le_bytes(len) as usize;
-    if len > MAX_WINDOW_FRAME {
-        bail!("peer sent an oversized window frame ({len} bytes)");
+    if len > MAX_CLIPBOARD {
+        bail!("the other device sent an oversized clipboard ({len} bytes)");
     }
     let mut buf = vec![0u8; len];
     recv.read_exact(&mut buf).await?;
-    Ok(WindowStream::from_bytes(&buf)?)
+    Ok(Clipboard::from_bytes(&buf)?)
 }
 
 fn check_protocol(peer: &Hello) -> anyhow::Result<()> {
@@ -1032,48 +874,6 @@ impl Engine {
             }
             Command::RetryPermissions => self.start_backends(),
             Command::Pair(address) => self.start_pairing(address),
-            Command::ListWindows => {
-                let events = self.events.clone();
-                tokio::spawn(async move {
-                    let _ = events.send(match capture_window::shareable_windows().await {
-                        Ok(list) => Event::ShareableWindows(list),
-                        Err(e) => Event::ShareFailed(format!("{e:#}")),
-                    });
-                });
-            }
-            Command::ShareWindow(window) => {
-                if self.session.is_none() {
-                    let _ = self.events.send(Event::ShareFailed("Connect to the other device first.".into()));
-                    return;
-                }
-                if !self.config.windows.enabled {
-                    let _ = self.events.send(Event::ShareFailed("Window sharing is turned off (Windows page).".into()));
-                    return;
-                }
-                let tx = self.internal.clone();
-                if let Some(test) = std::env::var_os("DEXTR_TEST_WINDOW") {
-                    // "drag" pretends the window was dragged across, held at (100, 20).
-                    let grab = (test == "drag").then_some((100.0, 20.0));
-                    let _ = tx.send(Internal::ShareReady { result: Ok(test_pattern()), grab });
-                    return;
-                }
-                tokio::spawn(async move {
-                    let result = capture_window::capture_window(window, false).await;
-                    let _ = tx.send(Internal::ShareReady { result, grab: None });
-                });
-            }
-            Command::StopSharing(id) => self.stop_sharing(id, true),
-            Command::CloseWindow(id) => {
-                if self.incoming.remove(&id).is_some() {
-                    self.surfaces.lock().unwrap().remove(&id);
-                    self.send(Message::WindowDismiss { id });
-                }
-            }
-            Command::WindowInput { id, input } => {
-                if self.incoming.contains_key(&id) {
-                    self.send(Message::WindowInput { id, input });
-                }
-            }
             Command::PairDecision(ok) => self.decide_pairing(ok),
             Command::SetPaused(paused) => {
                 self.paused = paused;
@@ -1169,38 +969,10 @@ impl Engine {
                 self.refresh_nearby();
                 self.start_session(est);
             }
-            Internal::ShareReady { result: Ok(capture), grab } => self.start_share(capture, grab),
-            Internal::ShareReady { result: Err(e), .. } => {
-                let reason = format!("{e:#}");
-                self.log(format!("Window sharing: {reason}"));
-                let _ = self.events.send(Event::ShareFailed(reason));
-            }
-            Internal::ShareOpened { session, info } => {
+            Internal::Clipboard { session, content } => {
                 if self.session.as_ref().is_some_and(|s| s.id == session) {
-                    self.log(format!("Sharing “{}”.", info.title));
-                    self.send(Message::WindowOpen(info));
+                    self.peer_clipboard(content);
                 }
-            }
-            Internal::ShareEnded { id, reason } => {
-                if self.shares.contains_key(&id) {
-                    self.log(format!("Stopped sharing a window: {reason}."));
-                    self.stop_sharing(id, true);
-                }
-            }
-            Internal::WindowFrame { session, id, resized } => {
-                if self.session.as_ref().is_none_or(|s| s.id != session) || !self.incoming.contains_key(&id) {
-                    return;
-                }
-                let surface = self.surfaces.lock().unwrap().get(&id).cloned();
-                let event = match surface {
-                    Some(s) if resized => {
-                        let (width, height) = s.size();
-                        Event::WindowResized { id, width, height }
-                    }
-                    Some(_) => Event::WindowFrame { id },
-                    None => return,
-                };
-                let _ = self.events.send(event);
             }
             Internal::InjectorStarted(_) | Internal::CaptureStarted(_) => unreachable!("handled in run()"),
         }
@@ -1385,111 +1157,65 @@ impl Engine {
         self.save_and_publish(&format!("Display arrangement updated to match {name}."));
     }
 
-    // ── Window sharing ──────────────────────────────────────────────────
+    // ── Clipboard ───────────────────────────────────────────────────────
 
-    fn start_share(&mut self, capture: WindowCapture, grab: Option<(f32, f32)>) {
+    /// Something was copied here: send it to the other device.
+    fn local_clipboard(&mut self, content: ClipContent) {
+        let c = &self.config.clipboard;
         let Some(session) = &self.session else { return };
-        self.next_share += 1;
-        let id = self.next_share;
-        let size = Arc::new(std::sync::Mutex::new((0, 0)));
-        let geometry = capture.geometry.clone();
-        let input = capture.input_handle();
-        let (title, app) = (capture.title.clone(), capture.app.clone());
-        let min_interval = match self.config.windows.frame_rate {
-            FrameRate::Match => Duration::ZERO,
-            FrameRate::Fps30 => Duration::from_micros(33_333),
-            FrameRate::Fps60 => Duration::from_micros(16_667),
-            FrameRate::Fps120 => Duration::from_micros(8_333),
-        };
-        let task = tokio::spawn(stream_window(
-            session.conn.clone(),
-            session.id,
-            id,
-            capture,
-            grab,
-            size.clone(),
-            min_interval,
-            self.internal.clone(),
-        ));
-        if geometry.borrow().is_none() {
-            self.log(format!("“{title}” is shared view-only: dextr can't tell where it is on screen (this needs KDE Plasma)."));
-        }
-        self.shares.insert(id, Share { title, app, geometry, input, size, task });
-        self.publish_shares();
-    }
-
-    fn stop_sharing(&mut self, id: u32, tell_peer: bool) {
-        if let Some(share) = self.shares.remove(&id) {
-            share.task.abort();
-            if tell_peer {
-                self.send(Message::WindowClose { id });
-            }
-            self.publish_shares();
-        }
-    }
-
-    fn publish_shares(&self) {
-        let mut list: Vec<SharedWindow> = self
-            .shares
-            .iter()
-            .map(|(&id, s)| SharedWindow { id, title: s.title.clone(), app: s.app.clone(), interactive: s.geometry.borrow().is_some() })
-            .collect();
-        list.sort_by_key(|w| w.id);
-        let _ = self.events.send(Event::Sharing(list));
-    }
-
-    /// The other device shares a window.
-    fn window_opened(&mut self, info: WindowInfo) {
-        let w = &self.config.windows;
-        if !w.enabled || !w.accept_incoming {
-            self.send(Message::WindowDismiss { id: info.id });
-            self.log(format!("Declined a shared window (“{}”): receiving windows is turned off.", info.title));
+        if !c.enabled {
             return;
         }
-        let surface = self.surfaces.lock().unwrap().entry(info.id).or_default().clone();
-        let from = self.session.as_ref().map(|s| s.peer.name.clone()).unwrap_or_default();
-        self.incoming.insert(info.id, info.clone());
-        // Dragged across while the sender controls us: it goes under the pointer.
-        let pointer = (info.grab.is_some() && self.mode == Mode::Controlled).then_some(self.pointer_here);
-        let pointer = pointer.or_else(|| {
-            // Test mode: no input, so use a fixed spot.
-            (info.grab.is_some() && std::env::var_os("DEXTR_TEST_NO_INPUT").is_some()).then_some((500.0, 300.0))
+        let (message, what) = match content {
+            ClipContent::Text(text) => {
+                let what = format!("text ({} characters)", text.chars().count());
+                (Clipboard::Text(text), what)
+            }
+            ClipContent::Png(png) if c.images => {
+                let what = format!("an image ({} KB)", png.len().div_ceil(1024));
+                (Clipboard::Image { png }, what)
+            }
+            ClipContent::Png(_) => return,
+        };
+        let size = match &message {
+            Clipboard::Text(t) => t.len(),
+            Clipboard::Image { png } => png.len(),
+        };
+        if size > c.max_mb as usize * 1024 * 1024 {
+            self.log(format!("Didn't share the clipboard: {what} is over the {} MB limit.", c.max_mb));
+            return;
+        }
+        tracing::debug!("sharing the clipboard: {what}");
+        let conn = session.conn.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let mut out = conn.open_uni().await?;
+                out.write_all(&message.to_frame()?).await?;
+                out.finish()?;
+                anyhow::Ok(())
+            };
+            if let Err(e) = result.await {
+                tracing::debug!("clipboard not sent: {e:#}");
+            }
         });
-        let _ = self.events.send(Event::WindowOpened { info, from, surface, pointer });
     }
 
-    /// The other device stopped sharing a window.
-    fn window_closed(&mut self, id: u32) {
-        self.surfaces.lock().unwrap().remove(&id);
-        if self.incoming.remove(&id).is_some() {
-            let _ = self.events.send(Event::WindowClosed { id });
-        }
-    }
-
-    /// Input from the other device on one of our shared windows: place it on
-    /// the real window.
-    fn window_input(&mut self, id: u32, input: Input) {
-        let Some(share) = self.shares.get(&id) else { return };
-        share.input.prepare();
-        let Some(g) = *share.geometry.borrow() else { return };
-        let (fw, fh) = *share.size.lock().unwrap();
-        if fw == 0 || fh == 0 {
+    /// The other device copied something: put it on our clipboard.
+    fn peer_clipboard(&mut self, content: Clipboard) {
+        let c = &self.config.clipboard;
+        if !c.enabled {
             return;
         }
-        let at = |x: f32, y: f32| (g.x + x * g.width / fw as f32, g.y + y * g.height / fh as f32);
-        let input = match input {
-            Input::Motion { x, y } => {
-                let (x, y) = at(x, y);
-                Input::Motion { x, y }
-            }
-            Input::Button { button, pressed, x, y } => {
-                let (x, y) = at(x, y);
-                Input::Button { button, pressed, x, y }
-            }
-            other => other,
+        let content = match content {
+            Clipboard::Text(text) => ClipContent::Text(text),
+            Clipboard::Image { png } if c.images => ClipContent::Png(png),
+            Clipboard::Image { .. } => return,
         };
-        if let Some(i) = &self.injector {
-            i.inject(input);
+        if content.len() > c.max_mb as usize * 1024 * 1024 {
+            return;
+        }
+        if let Some(clipboard) = &self.clipboard {
+            clipboard.set(content);
         }
     }
 
@@ -1595,8 +1321,8 @@ impl Engine {
             };
             let _ = tx.send(Internal::SessionClosed { session: id, reason });
         });
-        // Windows the other device shares.
-        tokio::spawn(receive_windows(conn.clone(), id, self.surfaces.clone(), self.internal.clone()));
+        // Clipboard contents from the other device (one stream per copy).
+        tokio::spawn(receive_clipboard(conn.clone(), id, self.internal.clone()));
         // Datagram reader (pointer motion).
         let (tx, c) = (self.internal.clone(), conn.clone());
         tokio::spawn(async move {
@@ -1620,9 +1346,6 @@ impl Engine {
         self.session = Some(Session { id, dialed, conn, out: out_tx, peer });
         // Whichever device was arranged last wins.
         self.send_arrangement();
-        if std::env::var_os("DEXTR_TEST_WINDOW").is_some_and(|v| v == "share" || v == "drag") {
-            self.command(Command::ShareWindow(None));
-        }
         self.sync_capture();
     }
 
@@ -1656,15 +1379,6 @@ impl Engine {
         }
         self.set_mode(Mode::Local);
         self.sync_capture();
-        self.swallow_release = false;
-        // Shared windows end with the connection, in both directions.
-        for id in self.shares.keys().copied().collect::<Vec<_>>() {
-            self.stop_sharing(id, false);
-        }
-        for id in std::mem::take(&mut self.incoming).into_keys() {
-            let _ = self.events.send(Event::WindowClosed { id });
-        }
-        self.surfaces.lock().unwrap().clear();
         session.conn.close(0u32.into(), b"bye");
         let _ = self.events.send(Event::Disconnected { reason });
         self.schedule_reconnect();
@@ -1677,7 +1391,7 @@ impl Engine {
         // capture was switched off: never take the pointer (it would stay
         // hidden). Hand it straight back.
         if self.mode == Mode::Controlled
-            && let CaptureEvent::Activated { x, y } | CaptureEvent::DragOut { x, y, .. } = event
+            && let CaptureEvent::Activated { x, y } = event
         {
             if let Some(c) = &self.capture {
                 c.release(x, y);
@@ -1689,7 +1403,6 @@ impl Engine {
         }
         match event {
             CaptureEvent::Activated { x, y } => self.activated(x, y),
-            CaptureEvent::DragOut { x, y, window, grab } => self.drag_out(x, y, window, grab),
             CaptureEvent::Input(input) if self.mode == Mode::Controlling => self.forward(input),
             CaptureEvent::Input(_) => {}
             CaptureEvent::Deactivated => {
@@ -1707,31 +1420,6 @@ impl Engine {
                 let _ = self.events.send(Event::CaptureReady(Err(reason)));
             }
         }
-    }
-
-    /// A window was dragged across the edge: the pointer goes to the peer and
-    /// the window comes along, parked out of sight here.
-    fn drag_out(&mut self, x: f32, y: f32, window: u64, grab: (f32, f32)) {
-        let ours = self.our_screens();
-        let entry = if self.paused { None } else { edge::entry_point(self.config.link(), x, y, &ours, self.peer_screens()) };
-        let Some(p) = entry.filter(|_| self.session.is_some()) else {
-            // Nowhere to go: give the pointer back.
-            let back = edge::inside_edge(self.config.peer_side, x, y, &ours).unwrap_or((x, y));
-            if let Some(c) = &self.capture {
-                c.release(back.0, back.1);
-            }
-            return;
-        };
-        self.enter_peer(p);
-        self.swallow_release = true;
-        if !self.config.windows.enabled {
-            return;
-        }
-        let tx = self.internal.clone();
-        tokio::spawn(async move {
-            let result = capture_window::capture_window(Some(window), true).await;
-            let _ = tx.send(Internal::ShareReady { result, grab: Some(grab) });
-        });
     }
 
     fn activated(&mut self, x: f32, y: f32) {
@@ -1807,7 +1495,7 @@ impl Engine {
                 }
             }
             CaptureEvent::Input(_) => self.cancel_switch(p),
-            CaptureEvent::Activated { .. } | CaptureEvent::DragOut { .. } => self.pending_switch = Some(p),
+            CaptureEvent::Activated { .. } => self.pending_switch = Some(p),
             CaptureEvent::Deactivated => {}
             CaptureEvent::Stopped { reason } => {
                 self.capture = None;
@@ -1831,7 +1519,6 @@ impl Engine {
                     self.send_motion(self.pointer.0, self.pointer.1);
                 }
             }
-            Captured::Button { button: Button::Left, pressed: false } if std::mem::take(&mut self.swallow_release) => {}
             Captured::Button { button, pressed } => {
                 let button = match (self.config.mouse.swap_buttons, button) {
                     (true, Button::Left) => Button::Right,
@@ -1909,7 +1596,6 @@ impl Engine {
                 }
                 self.set_mode(Mode::Controlled);
                 self.sync_capture();
-                self.pointer_here = (x, y);
                 if let Some(i) = &self.injector {
                     i.inject(Input::Motion { x, y });
                 } else {
@@ -1917,9 +1603,6 @@ impl Engine {
                 }
             }
             Message::Input(input) => {
-                if let Input::Motion { x, y } | Input::Button { x, y, .. } = input {
-                    self.pointer_here = (x, y);
-                }
                 if self.mode == Mode::Controlled
                     && let Some(i) = &self.injector
                 {
@@ -1966,10 +1649,6 @@ impl Engine {
             // Only valid before a session starts.
             Message::Hello(_) | Message::PairRequest { .. } | Message::PairAccept | Message::PairReject => {}
             Message::Arrangement { side, offset, changed_at } => self.peer_arranged(Link { side, offset }, changed_at),
-            Message::WindowOpen(info) => self.window_opened(info),
-            Message::WindowClose { id } => self.window_closed(id),
-            Message::WindowDismiss { id } => self.stop_sharing(id, false),
-            Message::WindowInput { id, input } => self.window_input(id, input),
         }
     }
 }
@@ -2044,34 +1723,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_window_arrives_pixel_exact() {
-        use dextr_platform::window::CapturedFrame;
-        let (a, b) = (temp_identity("wa"), temp_identity("wb"));
+    async fn clipboard_crosses_on_its_own_stream() {
+        let (a, b) = (temp_identity("ca"), temp_identity("cb"));
         let (at_a, at_b) = try_pair(&a, b.fingerprint, &b).await.unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(receive_clipboard(at_a.conn.clone(), 9, tx));
 
-        // B shares a 64×40 window that sits at (100, 50) on its screen at 2×.
-        let (frames_tx, frames) = watch::channel(None);
-        let (_geometry_tx, geometry) = watch::channel(Some(WindowGeometry { x: 100.0, y: 50.0, width: 32.0, height: 20.0 }));
-        let (_ended_tx, ended) = tokio::sync::oneshot::channel();
-        let capture = WindowCapture::from_parts("Notes".into(), "notes".into(), frames, geometry, ended);
-        let pixels: Vec<u8> = (0..64 * 40 * 4).map(|i| (i % 251) as u8).collect();
-        frames_tx.send_replace(Some(Arc::new(CapturedFrame { width: 64, height: 40, stride: 256, data: pixels.clone() })));
-
-        let (tx_b, mut rx_b) = mpsc::unbounded_channel();
-        let (tx_a, mut rx_a) = mpsc::unbounded_channel();
-        let size = Arc::new(std::sync::Mutex::new((0, 0)));
-        tokio::spawn(stream_window(at_b.conn.clone(), 1, 7, capture, Some((10.0, 5.0)), size.clone(), Duration::ZERO, tx_b));
-        let surfaces: Surfaces = Arc::default();
-        tokio::spawn(receive_windows(at_a.conn.clone(), 1, surfaces.clone(), tx_a));
-
-        let Some(Internal::ShareOpened { info, .. }) = rx_b.recv().await else { panic!("not announced") };
-        assert_eq!((info.id, info.width, info.height, info.scale, info.title.as_str()), (7, 64, 40, 2.0, "Notes"));
-        // Held 10×5 points from its corner on a 2× display: 20×10 pixels.
-        assert_eq!(info.grab, Some((20.0, 10.0)));
-        let Some(Internal::WindowFrame { id: 7, resized: true, .. }) = rx_a.recv().await else { panic!("no frame") };
-        let surface = surfaces.lock().unwrap().get(&7).cloned().unwrap();
-        assert_eq!(surface.lock().pixels, pixels);
-        assert_eq!(*size.lock().unwrap(), (64, 40));
+        for sent in [Clipboard::Text("héllo 👋".into()), Clipboard::Image { png: vec![0x89, b'P', b'N', b'G', 1, 2, 3] }] {
+            let mut out = at_b.conn.open_uni().await.unwrap();
+            out.write_all(&sent.to_frame().unwrap()).await.unwrap();
+            out.finish().unwrap();
+            let Some(Internal::Clipboard { session: 9, content }) = rx.recv().await else { panic!("nothing arrived") };
+            assert_eq!(content, sent);
+        }
     }
 
     #[tokio::test]

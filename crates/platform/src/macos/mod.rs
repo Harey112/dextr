@@ -16,12 +16,9 @@
 mod capture;
 mod ffi;
 mod inject;
-mod sck;
-mod window;
 
 pub(crate) use capture::spawn_capture;
 pub(crate) use inject::spawn_injector;
-pub(crate) use window::{capture_window, place_own_window, shareable_windows};
 
 use dextr_proto::{Button, Rect};
 

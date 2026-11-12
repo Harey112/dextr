@@ -13,7 +13,7 @@
 
 use dextr_proto::{Button, Input, Key, Rect, Side};
 
-pub mod window;
+pub mod clipboard;
 use tokio::sync::{mpsc, oneshot, watch};
 
 #[cfg(target_os = "linux")]
@@ -48,11 +48,6 @@ pub enum CaptureEvent {
     /// The pointer crossed the edge at (x, y), local coordinates. All local
     /// input now goes to us until [`CaptureHandle::release`].
     Activated { x: f32, y: f32 },
-    /// Like `Activated`, while the user was dragging a window across the
-    /// edge: send that window along. `grab` is where the pointer holds it,
-    /// relative to the window's top-left, in local logical pixels. The drag
-    /// has already been ended on this device.
-    DragOut { x: f32, y: f32, window: u64, grab: (f32, f32) },
     Input(Captured),
     /// The compositor ended the capture on its own (for example, the user
     /// pressed its own escape shortcut).
