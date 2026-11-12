@@ -5,6 +5,7 @@
 
 mod arrangement;
 mod autostart;
+mod icon;
 mod pages;
 
 use std::collections::VecDeque;
@@ -28,11 +29,23 @@ fn main() -> iced::Result {
         )
         .init();
 
+    #[cfg(target_os = "linux")]
+    icon::install_desktop_entry();
+
     iced::application(App::new, App::update, App::view)
         .title(App::title)
         .theme(App::theme)
         .subscription(App::subscription)
-        .window_size((980.0, 680.0))
+        .window(iced::window::Settings {
+            size: iced::Size::new(980.0, 680.0),
+            icon: icon::window_icon(),
+            #[cfg(target_os = "linux")]
+            platform_specific: iced::window::settings::PlatformSpecific {
+                application_id: icon::APP_ID.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
         .run()
 }
 
@@ -370,7 +383,12 @@ impl App {
             self.confirm = None;
         }
         match message {
-            Message::EngineStarted(tx) => self.engine = Some(tx),
+            Message::EngineStarted(tx) => {
+                self.engine = Some(tx);
+                // The app is running now (main thread): give it its Dock icon.
+                #[cfg(target_os = "macos")]
+                icon::set_dock_icon();
+            }
             Message::Engine(event) => return self.on_event(*event),
             Message::Navigate(page) => self.page = page,
             Message::Name(v) => self.form.name = v,

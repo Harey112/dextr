@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- dextr: a pointer passing through the shared edge between two screens. -->
+  <rect width="512" height="512" rx="112" fill="#111827"/>
+  <path d="M256 88 V424" stroke="#334155" stroke-width="16" stroke-dasharray="24 28" stroke-linecap="round" fill="none"/>
+  <path d="M120 160 L120 344 L168 296 L204 376 L240 360 L204 280 L272 280 Z" fill="#ffffff" fill-opacity="0.25"/>
+  <path d="M248 160 L248 344 L296 296 L332 376 L368 360 L332 280 L400 280 Z" fill="#22d3ee"/>
+</svg>

@@ -854,6 +854,7 @@ dependencies = [
  "dextr-core",
  "dextr-proto",
  "iced",
+ "image",
  "tokio",
  "tracing",
  "tracing-subscriber",

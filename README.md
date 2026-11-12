@@ -27,6 +27,13 @@ No `input` group or `/dev/input` access is used.
 
 macOS media keys (volume, play) are not forwarded to a Mac yet.
 
+## Icon
+
+`assets/icon.svg` is the source. `assets/icons/` holds PNGs from 16 to 1024 px and
+`assets/dextr.icns` is the macOS icon. On Linux, dextr installs its icon and a launcher entry for the
+current user on start (`~/.local/share/icons` and `~/.local/share/applications/dev.dextr.dextr.desktop`),
+so the taskbar and app menu show it. On macOS it sets its Dock icon itself.
+
 ## Run
 
 ### Linux
