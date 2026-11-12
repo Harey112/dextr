@@ -45,6 +45,12 @@ impl Link {
         }
     }
 
+    /// The same arrangement seen from the other device: it sits on the
+    /// opposite side, and its edge starts where ours ends up relative to it.
+    pub fn mirrored(self) -> Link {
+        Link { side: self.side.opposite(), offset: self.offset.map(|o| -o) }
+    }
+
     /// What to add to a peer coordinate to get ours (along x, along y).
     fn shift(&self, ob: Rect, tb: Rect) -> (f32, f32) {
         let (px, py) = self.place(ob, tb);
@@ -170,6 +176,45 @@ mod tests {
         // …above it the pointer comes back at the matching height.
         assert!(crossed_back(link, -1.0, 400.0, &LAPTOP, &MAC));
         assert_eq!(return_point(link, -1.0, 400.0, &LAPTOP, &MAC).unwrap(), (1918.0, 1000.0));
+    }
+
+    #[test]
+    fn mirrored_arrangement_crosses_at_the_same_spot_both_ways() {
+        for link in [
+            Link { side: Side::Right, offset: Some(600) },
+            Link { side: Side::Top, offset: Some(-300) },
+            Link { side: Side::Left, offset: None },
+        ] {
+            let back = link.mirrored();
+            assert_eq!(back.mirrored(), link);
+            // A point on the laptop's shared edge enters the Mac somewhere…
+            let (ob, tb) = (LAPTOP[0], MAC[0]);
+            let (px, py) = link.place(ob, tb);
+            // A spot where the two edges touch.
+            let (ax, ay) = (px.max(0) as f32 + 100.0, py.max(0) as f32 + 100.0);
+            let a = match link.side {
+                Side::Right => (1919.0, ay),
+                Side::Left => (0.0, ay),
+                Side::Top => (ax, 0.0),
+                Side::Bottom => (ax, 1079.0),
+            };
+            let on_mac = entry_point(link, a.0, a.1, &LAPTOP, &MAC).unwrap();
+            // …and leaving the Mac there, by its mirrored arrangement, lands
+            // back on the same spot of the laptop's edge.
+            let edge_x = match back.side {
+                Side::Right => 1511.0,
+                Side::Left => 0.0,
+                _ => on_mac.0,
+            };
+            let edge_y = match back.side {
+                Side::Bottom => 981.0,
+                Side::Top => 0.0,
+                _ => on_mac.1,
+            };
+            let on_laptop = entry_point(back, edge_x, edge_y, &MAC, &LAPTOP).unwrap();
+            let along = |p: (f32, f32)| if link.side.is_horizontal() { p.1 } else { p.0 };
+            assert_eq!(along(on_laptop), along(a), "{link:?}");
+        }
     }
 
     #[test]

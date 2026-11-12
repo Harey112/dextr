@@ -69,7 +69,7 @@ quit and restart dextr. If macOS asks whether dextr may accept incoming network 
 3. Both screens show the same 6-digit code. If they match, press **Codes match** on both.
 
 That's all: they connect now, and from then on by themselves, even after one gets a new IP address.
-Arrange the screens on the **Displays** page. Push the pointer off the shared edge to move to the
+Arrange the screens on the **Displays** page; both devices keep the same layout (the newest change wins). Push the pointer off the shared edge to move to the
 other device. **Ctrl+Alt+Esc** always brings it back.
 
 dextr uses UDP port **47800** for the connection and **47801** to find devices. On Linux with a

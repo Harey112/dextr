@@ -25,6 +25,9 @@ pub struct Config {
     /// Position of the peer's screens along that side, in pixels from the
     /// start of our edge. `None` centers them.
     pub peer_offset: Option<i32>,
+    /// When the arrangement last changed (Unix ms), so the two devices can
+    /// keep the newest one.
+    pub arranged_at: u64,
     /// Saved RemoteDesktop portal grant, so the permission dialog is shown once.
     pub inject_restore_token: Option<String>,
     /// The peer's name and screens from the last connection, so the display
@@ -48,6 +51,7 @@ impl Default for Config {
             peer_fingerprint: String::new(),
             peer_side: Side::Right,
             peer_offset: None,
+            arranged_at: 0,
             inject_restore_token: None,
             last_peer_name: None,
             last_peer_screens: Vec::new(),

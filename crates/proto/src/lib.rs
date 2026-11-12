@@ -119,6 +119,11 @@ pub enum Message {
     WindowClose { id: u32 },
     /// Receiver → sender: the user closed the shared window here.
     WindowDismiss { id: u32 },
+    /// Where the receiver sits next to the sender's screens: on `side` of
+    /// them, its edge starting `offset` pixels along theirs (`None`:
+    /// centered). The receiver mirrors it if `changed_at` (Unix ms) is newer
+    /// than its own arrangement.
+    Arrangement { side: Side, offset: Option<i32>, changed_at: u64 },
     /// Receiver → sender: input on a shared window. Positions are in the
     /// window's own pixels, from its top-left corner.
     WindowInput { id: u32, input: Input },

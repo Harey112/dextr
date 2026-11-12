@@ -22,7 +22,7 @@ use tokio::{
 use crate::{
     config::{self, Config},
     discovery::{self, LocalAddress},
-    edge,
+    edge::{self, Link},
     identity::{self, Fingerprint, Identity},
     settings::FrameRate,
     tls,
@@ -31,6 +31,10 @@ use crate::{
 
 /// The paired device's fingerprint, if any.
 type Trusted = Arc<RwLock<Option<Fingerprint>>>;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+}
 
 /// How long a pairing request waits for both users.
 const PAIRING_TIMEOUT: Duration = Duration::from_secs(120);
@@ -921,12 +925,14 @@ impl Engine {
 
     fn command(&mut self, command: Command) {
         match command {
-            Command::Apply(new) => {
+            Command::Apply(mut new) => {
                 if new.peer_side != self.config.peer_side
                     && let Some(c) = &self.capture
                 {
                     c.set_side(new.peer_side);
                 }
+                let rearranged = new.link() != self.config.link();
+                new.arranged_at = if rearranged { now_ms() } else { self.config.arranged_at };
                 *self.trusted.write().unwrap() = identity::parse(&new.peer_fingerprint);
                 if new.device_name != self.config.device_name {
                     let name = new.device_name.clone();
@@ -945,6 +951,9 @@ impl Engine {
                 match self.config.save() {
                     Ok(()) => self.log("Settings saved.".into()),
                     Err(e) => self.log(format!("Cannot save settings: {e:#}")),
+                }
+                if rearranged {
+                    self.send_arrangement();
                 }
             }
             Command::Connect => {
@@ -988,7 +997,9 @@ impl Engine {
                 }
                 self.paused = false;
                 self.sync_capture();
+                self.config.arranged_at = now_ms();
                 self.save_and_publish("Settings reset to defaults. Pairing, name and port were kept.");
+                self.send_arrangement();
             }
             Command::RetryPermissions => self.start_backends(),
             Command::Pair(address) => self.start_pairing(address),
@@ -1312,6 +1323,36 @@ impl Engine {
         let _ = self.events.send(Event::Nearby(list));
     }
 
+    // ── Display arrangement ─────────────────────────────────────────────
+
+    fn send_arrangement(&self) {
+        let link = self.config.link();
+        self.send(Message::Arrangement { side: link.side, offset: link.offset, changed_at: self.config.arranged_at });
+    }
+
+    /// The other device's arrangement: mirror it if it's newer than ours.
+    fn peer_arranged(&mut self, theirs: Link, changed_at: u64) {
+        let ours = self.config.arranged_at;
+        // Same instant (or neither ever arranged): the lower fingerprint wins.
+        let peer_lower = self.trusted.read().unwrap().is_some_and(|peer| peer < self.identity.fingerprint);
+        if changed_at < ours || (changed_at == ours && (changed_at == 0 || !peer_lower)) {
+            return;
+        }
+        let link = theirs.mirrored();
+        self.config.arranged_at = changed_at;
+        if link == self.config.link() {
+            let _ = self.config.save();
+            return;
+        }
+        self.config.peer_side = link.side;
+        self.config.peer_offset = link.offset;
+        if let Some(c) = &self.capture {
+            c.set_side(link.side);
+        }
+        let name = self.session.as_ref().map(|s| s.peer.name.clone()).unwrap_or_default();
+        self.save_and_publish(&format!("Display arrangement updated to match {name}."));
+    }
+
     // ── Window sharing ──────────────────────────────────────────────────
 
     fn start_share(&mut self, capture: WindowCapture) {
@@ -1536,6 +1577,8 @@ impl Engine {
             self.log(format!("{} reported no screens, so the pointer can't move there yet.", peer.name));
         }
         self.session = Some(Session { id, dialed, conn, out: out_tx, peer });
+        // Whichever device was arranged last wins.
+        self.send_arrangement();
         if std::env::var_os("DEXTR_TEST_WINDOW").is_some_and(|v| v == "share") {
             self.command(Command::ShareWindow(None));
         }
@@ -1838,6 +1881,7 @@ impl Engine {
             }
             // Only valid before a session starts.
             Message::Hello(_) | Message::PairRequest { .. } | Message::PairAccept | Message::PairReject => {}
+            Message::Arrangement { side, offset, changed_at } => self.peer_arranged(Link { side, offset }, changed_at),
             Message::WindowOpen(info) => self.window_opened(info),
             Message::WindowClose { id } => self.window_closed(id),
             Message::WindowDismiss { id } => self.stop_sharing(id, false),

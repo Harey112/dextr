@@ -439,6 +439,7 @@ fn displays(app: &App) -> Element<'_, Message> {
             column![
                 arrangement_canvas(app, true, 340.0),
                 muted("Drag the screens to any side and slide them along it. The pointer crosses only where the edges touch (the green line), at the same spot on both screens. They snap to centered or aligned edges when close."),
+                muted("The arrangement is shared: the other device shows the same layout from its side, and a change on either one updates both.").size(12),
             ]
             .spacing(14),
         ),
