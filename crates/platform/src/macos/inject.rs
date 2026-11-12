@@ -20,10 +20,13 @@ pub(crate) fn spawn_injector(
     _restore: Option<RestoreToken>,
     mut commands: mpsc::UnboundedReceiver<InjectCommand>,
     screens_tx: watch::Sender<Vec<Rect>>,
-    _stopped: watch::Sender<Option<String>>,
+    stopped: watch::Sender<Option<String>>,
     ready: oneshot::Sender<anyhow::Result<Option<RestoreToken>>>,
 ) -> anyhow::Result<()> {
     spawn_backend_thread("dextr-inject", move || async move {
+        // Keep the sender alive for as long as the injector runs: dropping it
+        // tells the engine the injector stopped.
+        let stopped = stopped;
         let source = unsafe {
             if !CGPreflightPostEventAccess() {
                 CGRequestPostEventAccess();
@@ -62,6 +65,7 @@ pub(crate) fn spawn_injector(
         }
         injector.release_all();
         unsafe { CFRelease(source) };
+        let _ = stopped.send(Some("input injection stopped".into()));
     })
 }
 
