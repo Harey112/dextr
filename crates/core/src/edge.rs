@@ -7,15 +7,20 @@
 
 use dextr_proto::{Rect, Side};
 
-/// How the peer's screens are placed against ours: which side, and how far
-/// along that side. Positions are in pixels, like the OS display settings,
-/// so the pointer only crosses where the two edges actually touch.
+/// How the peer's screens are placed against ours.
+///
+/// * **Exact**: real sizes, any side, any position along it, like the OS
+///   display settings. The pointer crosses only where the two edges touch,
+///   at the same pixel.
+/// * **Proportional**: the whole edge maps to the whole edge. Leaving 30% of
+///   the way down ours enters 30% of the way down theirs, whatever the sizes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Link {
     pub side: Side,
-    /// Start of the peer's edge relative to the start of ours (top for
-    /// left/right, left for top/bottom). `None` centers it.
+    /// Exact only: start of the peer's edge relative to the start of ours
+    /// (top for left/right, left for top/bottom). `None` centers it.
     pub offset: Option<i32>,
+    pub proportional: bool,
 }
 
 /// How much of the edges must always touch.
@@ -48,7 +53,7 @@ impl Link {
     /// The same arrangement seen from the other device: it sits on the
     /// opposite side, and its edge starts where ours ends up relative to it.
     pub fn mirrored(self) -> Link {
-        Link { side: self.side.opposite(), offset: self.offset.map(|o| -o) }
+        Link { side: self.side.opposite(), offset: self.offset.map(|o| -o), proportional: self.proportional }
     }
 
     /// What to add to a peer coordinate to get ours (along x, along y).
@@ -68,9 +73,45 @@ fn span(side: Side, r: Rect) -> (f32, f32) {
     if side.is_horizontal() { (r.y as f32, r.bottom()) } else { (r.x as f32, r.right()) }
 }
 
+// ── Proportional ────────────────────────────────────────────────────────
+
+/// The outer edge of `screens` on `side`: the screens along it, together.
+fn outer_edge(screens: &[Rect], side: Side) -> Option<Rect> {
+    Rect::bounds(&Rect::on_outer_edge(screens, side))
+}
+
+/// Fraction (0..=1) of the way along `edge` at (x, y).
+fn fraction(side: Side, edge: Rect, x: f32, y: f32) -> f32 {
+    let (start, end) = span(side, edge);
+    ((along(side, x, y) - start) / (end - start).max(1.0)).clamp(0.0, 1.0)
+}
+
+/// The point `f` of the way along `edge`.
+fn at_fraction(side: Side, edge: Rect, f: f32) -> f32 {
+    let (start, end) = span(side, edge);
+    (start + f * (end - start)).min(end - 1.0)
+}
+
+/// Proportional: where the pointer enters the peer, the same fraction along
+/// its facing edge.
+fn proportional_entry(side: Side, x: f32, y: f32, ours: &[Rect], theirs: &[Rect]) -> Option<(f32, f32)> {
+    let (oe, te) = (outer_edge(ours, side)?, outer_edge(theirs, side.opposite())?);
+    let a = at_fraction(side, te, fraction(side, oe, x, y));
+    let p = match side {
+        Side::Right => (te.x as f32 + 1.0, a),
+        Side::Left => (te.right() - 2.0, a),
+        Side::Bottom => (a, te.y as f32 + 1.0),
+        Side::Top => (a, te.bottom() - 2.0),
+    };
+    Some(Rect::clamp_to_any(theirs, p.0, p.1))
+}
+
 /// Where the pointer appears on the peer when it leaves us at (x, y), or
 /// `None` if the peer's screens don't touch our edge there.
 pub fn entry_point(link: Link, x: f32, y: f32, ours: &[Rect], theirs: &[Rect]) -> Option<(f32, f32)> {
+    if link.proportional {
+        return proportional_entry(link.side, x, y, ours, theirs);
+    }
     let (ob, tb) = (Rect::bounds(ours)?, Rect::bounds(theirs)?);
     let (sx, sy) = link.shift(ob, tb);
     let a = along(link.side, x, y) - if link.side.is_horizontal() { sy } else { sx };
@@ -101,6 +142,19 @@ pub fn in_dead_corner(side: Side, x: f32, y: f32, ours: &[Rect], size: f32) -> b
 /// Whether the virtual pointer on the peer has crossed back over the part
 /// of its edge that touches ours. Elsewhere the edge is a wall.
 pub fn crossed_back(link: Link, x: f32, y: f32, ours: &[Rect], theirs: &[Rect]) -> bool {
+    if link.proportional {
+        // Past the peer's edge that faces us, anywhere along it.
+        let Some(te) = outer_edge(theirs, link.side.opposite()) else { return true };
+        let past = match link.side {
+            Side::Right => x < te.x as f32,
+            Side::Left => x >= te.right(),
+            Side::Bottom => y < te.y as f32,
+            Side::Top => y >= te.bottom(),
+        };
+        let (start, end) = span(link.side, te);
+        let a = along(link.side, x, y);
+        return past && a >= start && a < end;
+    }
     let (Some(ob), Some(tb)) = (Rect::bounds(ours), Rect::bounds(theirs)) else { return true };
     let past = match link.side {
         Side::Right => x < tb.x as f32,
@@ -117,6 +171,13 @@ pub fn crossed_back(link: Link, x: f32, y: f32, ours: &[Rect], theirs: &[Rect]) 
 /// Where our pointer reappears when it comes back from the peer at (x, y),
 /// placed just inside our edge so it doesn't immediately re-trigger it.
 pub fn return_point(link: Link, x: f32, y: f32, ours: &[Rect], theirs: &[Rect]) -> Option<(f32, f32)> {
+    if link.proportional {
+        // The same fraction along our edge.
+        let (oe, te) = (outer_edge(ours, link.side)?, outer_edge(theirs, link.side.opposite())?);
+        let a = at_fraction(link.side, oe, fraction(link.side, te, x, y));
+        let (x, y) = if link.side.is_horizontal() { (0.0, a) } else { (a, 0.0) };
+        return inside_edge(link.side, x, y, &Rect::on_outer_edge(ours, link.side));
+    }
     let (ob, tb) = (Rect::bounds(ours)?, Rect::bounds(theirs)?);
     let (sx, sy) = link.shift(ob, tb);
     inside_edge(link.side, x + sx, y + sy, ours)
@@ -142,7 +203,7 @@ mod tests {
     const MAC: [Rect; 1] = [Rect::new(0, 0, 1512, 982)];
 
     fn centered(side: Side) -> Link {
-        Link { side, offset: None }
+        Link { side, offset: None, proportional: false }
     }
 
     #[test]
@@ -168,7 +229,7 @@ mod tests {
     #[test]
     fn crossing_only_where_edges_touch() {
         // The Mac sits low: its top is level with the laptop's y = 600.
-        let link = Link { side: Side::Right, offset: Some(600) };
+        let link = Link { side: Side::Right, offset: Some(600), proportional: false };
         assert!(entry_point(link, 1919.0, 300.0, &LAPTOP, &MAC).is_none());
         assert_eq!(entry_point(link, 1919.0, 700.0, &LAPTOP, &MAC).unwrap(), (1.0, 100.0));
         // Below the laptop's bottom the Mac's left edge is a wall…
@@ -181,9 +242,9 @@ mod tests {
     #[test]
     fn mirrored_arrangement_crosses_at_the_same_spot_both_ways() {
         for link in [
-            Link { side: Side::Right, offset: Some(600) },
-            Link { side: Side::Top, offset: Some(-300) },
-            Link { side: Side::Left, offset: None },
+            Link { side: Side::Right, offset: Some(600), proportional: false },
+            Link { side: Side::Top, offset: Some(-300), proportional: false },
+            Link { side: Side::Left, offset: None, proportional: false },
         ] {
             let back = link.mirrored();
             assert_eq!(back.mirrored(), link);
@@ -221,9 +282,38 @@ mod tests {
     fn offset_keeps_edges_touching() {
         let ob = LAPTOP[0];
         let tb = MAC[0];
-        assert_eq!(Link { side: Side::Right, offset: Some(5000) }.offset_for(ob, tb), 1080 - MIN_OVERLAP);
-        assert_eq!(Link { side: Side::Right, offset: Some(-5000) }.offset_for(ob, tb), MIN_OVERLAP - 982);
-        assert_eq!(Link { side: Side::Left, offset: None }.place(ob, tb), (-1512, 49));
+        assert_eq!(Link { side: Side::Right, offset: Some(5000), proportional: false }.offset_for(ob, tb), 1080 - MIN_OVERLAP);
+        assert_eq!(Link { side: Side::Right, offset: Some(-5000), proportional: false }.offset_for(ob, tb), MIN_OVERLAP - 982);
+        assert_eq!(Link { side: Side::Left, offset: None, proportional: false }.place(ob, tb), (-1512, 49));
+    }
+
+    #[test]
+    fn proportional_maps_the_whole_edge_to_the_whole_edge() {
+        let link = Link { side: Side::Right, offset: None, proportional: true };
+        // 30% down the laptop's right edge → 30% down the Mac's left edge.
+        assert_eq!(entry_point(link, 1919.0, 324.0, &LAPTOP, &MAC).unwrap(), (1.0, 0.3 * 982.0));
+        // Top corner to top corner, bottom to bottom.
+        assert_eq!(entry_point(link, 1919.0, 0.0, &LAPTOP, &MAC).unwrap().1, 0.0);
+        assert_eq!(entry_point(link, 1919.0, 1079.0, &LAPTOP, &MAC).unwrap().1.round(), 981.0);
+        // No dead zones: anywhere past the Mac's left edge goes back…
+        assert!(crossed_back(link, -1.0, 900.0, &LAPTOP, &MAC));
+        assert!(!crossed_back(link, 5.0, 900.0, &LAPTOP, &MAC));
+        // …at the same fraction of the laptop's edge.
+        let back = return_point(link, -1.0, 0.5 * 982.0, &LAPTOP, &MAC).unwrap();
+        assert_eq!(back, (1918.0, 540.0));
+        // Mirrored for the other device, still proportional.
+        assert_eq!(link.mirrored(), Link { side: Side::Left, offset: None, proportional: true });
+    }
+
+    #[test]
+    fn proportional_uses_the_outermost_screen() {
+        // Laptop plus a taller monitor to its right; the Mac sits right of that.
+        let ours = [Rect::new(0, 0, 1920, 1080), Rect::new(1920, -200, 2560, 1440)];
+        let link = Link { side: Side::Right, offset: None, proportional: true };
+        // Halfway down the outer monitor's right edge → halfway down the Mac.
+        let (x, y) = entry_point(link, 4479.0, 520.0, &ours, &MAC).unwrap();
+        assert_eq!((x, y), (1.0, 491.0));
+        assert_eq!(return_point(link, -1.0, 491.0, &ours, &MAC).unwrap(), (4478.0, 520.0));
     }
 
     #[test]

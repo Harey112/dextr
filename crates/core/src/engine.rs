@@ -23,11 +23,27 @@ use crate::{
     discovery::{self, LocalAddress},
     edge::{self, Link},
     identity::{self, Fingerprint, Identity},
+    settings::DisplayLayout,
     tls,
 };
 
 /// The paired device's fingerprint, if any.
 type Trusted = Arc<RwLock<Option<Fingerprint>>>;
+
+/// Test only: pretend screens, as `DEXTR_TEST_SCREENS=1920x1080,1280x1024`
+/// (side by side), when no input backend reports real ones.
+fn test_screens() -> Vec<Rect> {
+    let Ok(spec) = std::env::var("DEXTR_TEST_SCREENS") else { return Vec::new() };
+    let mut x = 0;
+    spec.split(',')
+        .filter_map(|s| {
+            let (w, h) = s.trim().split_once('x')?;
+            let r = Rect::new(x, 0, w.parse().ok()?, h.parse().ok()?);
+            x += r.w as i32;
+            Some(r)
+        })
+        .collect()
+}
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
@@ -358,6 +374,7 @@ async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: mpsc::Unbou
         clipboard,
     };
     engine.start_backends();
+    engine.report_screens();
     if engine.config.connection.auto_connect && engine.peer_configured() {
         engine.connect();
     }
@@ -734,7 +751,8 @@ impl Engine {
     /// controlled by the peer.
     fn sync_capture(&self) {
         if let Some(c) = &self.capture {
-            if self.session.is_some() && !self.paused && self.mode != Mode::Controlled {
+            let mouse_out = self.config.mouse.enabled && self.config.peer_rules().send.mouse;
+            if self.session.is_some() && !self.paused && mouse_out && self.mode != Mode::Controlled {
                 c.enable();
             } else {
                 c.disable();
@@ -787,6 +805,7 @@ impl Engine {
         } else {
             from_injector
         };
+        let displays = if displays.is_empty() { test_screens() } else { displays };
         Hello { protocol: PROTOCOL_VERSION, name: self.config.device_name.clone(), os: Os::current(), displays }
     }
 
@@ -840,6 +859,8 @@ impl Engine {
                     Ok(()) => self.log("Settings saved.".into()),
                     Err(e) => self.log(format!("Cannot save settings: {e:#}")),
                 }
+                // Master switches and device rules can turn edge watching on or off.
+                self.sync_capture();
                 if side_changed {
                     self.update_capture_side();
                 }
@@ -1151,7 +1172,12 @@ impl Engine {
 
     fn send_arrangement(&self) {
         let link = self.config.link();
-        self.send(Message::Arrangement { side: link.side, offset: link.offset, changed_at: self.config.arranged_at });
+        self.send(Message::Arrangement {
+            side: link.side,
+            offset: link.offset,
+            proportional: link.proportional,
+            changed_at: self.config.arranged_at,
+        });
     }
 
     /// The other device's arrangement: mirror it if it's newer than ours.
@@ -1170,6 +1196,7 @@ impl Engine {
         }
         self.config.peer_side = link.side;
         self.config.peer_offset = link.offset;
+        self.config.layout = if link.proportional { DisplayLayout::Proportional } else { DisplayLayout::Exact };
         self.update_capture_side();
         let name = self.session.as_ref().map(|s| s.peer.name.clone()).unwrap_or_default();
         self.save_and_publish(&format!("Display arrangement updated to match {name}."));
@@ -1181,7 +1208,7 @@ impl Engine {
     fn local_clipboard(&mut self, content: ClipContent) {
         let c = &self.config.clipboard;
         let Some(session) = &self.session else { return };
-        if !c.enabled {
+        if !c.enabled || !self.config.peer_rules().send.clipboard {
             return;
         }
         let (message, what) = match content {
@@ -1221,7 +1248,7 @@ impl Engine {
     /// The other device copied something: put it on our clipboard.
     fn peer_clipboard(&mut self, content: Clipboard) {
         let c = &self.config.clipboard;
-        if !c.enabled {
+        if !c.enabled || !self.config.peer_rules().receive.clipboard {
             return;
         }
         let content = match content {
@@ -1368,6 +1395,14 @@ impl Engine {
     }
 
     fn remember_peer(&mut self, name: &str, screens: &[Rect]) {
+        // List the device for its own rules (all allowed until changed).
+        if let Some(fp) = identity::parse(&self.config.peer_fingerprint) {
+            let rules = self.config.devices.entry(identity::format(&fp)).or_default();
+            if rules.name != name {
+                rules.name = name.to_owned();
+                self.save_and_publish(&format!("{name} added to the device list."));
+            }
+        }
         if self.config.last_peer_name.as_deref() != Some(name) || self.config.last_peer_screens != screens {
             self.config.last_peer_name = Some(name.to_owned());
             self.config.last_peer_screens = screens.to_vec();
@@ -1574,6 +1609,11 @@ impl Engine {
                     }
                     return;
                 }
+                // Keyboard off for this device: keys go nowhere while the
+                // pointer is over there (the shortcut above still works).
+                if !(self.config.keyboard.enabled && self.config.peer_rules().send.keyboard) {
+                    return;
+                }
                 let peer_os = self.session.as_ref().map(|s| s.peer.os).unwrap_or(Os::Other);
                 let key = self.config.keyboard.remap(key, Os::current(), peer_os);
                 self.send(Message::Input(Input::Key { key, pressed }));
@@ -1601,10 +1641,10 @@ impl Engine {
     fn inbound(&mut self, message: Message) {
         match message {
             Message::Enter { x, y } => {
-                if !self.config.connection.allow_control {
+                if !self.config.connection.allow_control || !self.config.peer_rules().receive.mouse {
                     // Hand control straight back.
                     self.send(Message::Leave);
-                    self.log("The other device tried to take control, but being controlled is turned off.".into());
+                    self.log("The other device tried to take control, but its mouse isn't allowed here.".into());
                     return;
                 }
                 if self.mode == Mode::Controlling {
@@ -1621,6 +1661,9 @@ impl Engine {
                 }
             }
             Message::Input(input) => {
+                if matches!(input, Input::Key { .. }) && !self.config.peer_rules().receive.keyboard {
+                    return; // its keyboard isn't allowed here
+                }
                 if self.mode == Mode::Controlled
                     && let Some(i) = &self.injector
                 {
@@ -1666,7 +1709,9 @@ impl Engine {
             }
             // Only valid before a session starts.
             Message::Hello(_) | Message::PairRequest { .. } | Message::PairAccept | Message::PairReject => {}
-            Message::Arrangement { side, offset, changed_at } => self.peer_arranged(Link { side, offset }, changed_at),
+            Message::Arrangement { side, offset, proportional, changed_at } => {
+                self.peer_arranged(Link { side, offset, proportional }, changed_at)
+            }
         }
     }
 }

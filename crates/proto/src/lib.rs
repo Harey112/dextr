@@ -16,7 +16,7 @@ pub use keys::Key;
 use serde::{Deserialize, Serialize};
 
 /// Bumped on every incompatible change to [`Message`].
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 
 /// ALPN identifier negotiated on the QUIC connection.
 pub const ALPN: &[u8] = b"dextr/1";
@@ -114,9 +114,9 @@ pub enum Message {
     PairReject,
     /// Where the receiver sits next to the sender's screens: on `side` of
     /// them, its edge starting `offset` pixels along theirs (`None`:
-    /// centered). The receiver mirrors it if `changed_at` (Unix ms) is newer
-    /// than its own arrangement.
-    Arrangement { side: Side, offset: Option<i32>, changed_at: u64 },
+    /// centered). `proportional` maps whole edge to whole edge instead. The
+    /// receiver mirrors it if `changed_at` (Unix ms) is newer than its own.
+    Arrangement { side: Side, offset: Option<i32>, proportional: bool, changed_at: u64 },
 }
 
 /// Clipboard contents, sent on a unidirectional stream of its own (it can

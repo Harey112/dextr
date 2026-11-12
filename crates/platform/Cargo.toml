@@ -20,4 +20,8 @@ ashpd = { workspace = true, features = ["input_capture", "remote_desktop", "scre
 reis.workspace = true
 rustix = { version = "1", features = ["time"] }
 wl-clipboard-rs = "0.9"
+ksni = { version = "0.3", default-features = false, features = ["tokio"] }
 
+
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+tray-icon = "0.26"

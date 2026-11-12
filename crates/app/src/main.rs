@@ -8,19 +8,24 @@ mod autostart;
 mod icon;
 mod pages;
 
-use std::collections::VecDeque;
+use std::{
+    collections::VecDeque,
+    sync::{Mutex, OnceLock},
+};
 
 use dextr_core::{
     Command, Config, Event, LocalAddress, Mode, Nearby, PairingState,
-    settings::{Appearance, ModifierMap, ReturnShortcut},
+    edge::Link,
+    settings::{Appearance, Channel, DisplayLayout, ModifierMap, ReturnShortcut},
 };
-use dextr_proto::{Os, Rect};
+use dextr_platform::tray::{TrayAction, TrayHandle, TrayState};
+use dextr_proto::{Os, Rect, Side};
 use iced::{
-    Subscription, Task, Theme,
+    Font, Subscription, Task, Theme,
     futures::{SinkExt, Stream},
+    window,
 };
-use tokio::sync::mpsc::UnboundedSender;
-use dextr_core::edge::Link;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 fn main() -> iced::Result {
     tracing_subscriber::fmt()
@@ -32,21 +37,53 @@ fn main() -> iced::Result {
     #[cfg(target_os = "linux")]
     icon::install_desktop_entry();
 
-    iced::application(App::new, App::update, App::view)
+    // `--hidden` (used by launch at login): start in the tray, no window.
+    let hidden = std::env::args().any(|a| a == "--hidden");
+
+    // A daemon, so dextr keeps running in the tray with its window closed.
+    iced::daemon(move || App::boot(hidden), App::update, App::view)
         .title(App::title)
         .theme(App::theme)
         .subscription(App::subscription)
-        .window(iced::window::Settings {
-            size: iced::Size::new(980.0, 680.0),
-            icon: icon::window_icon(),
-            #[cfg(target_os = "linux")]
-            platform_specific: iced::window::settings::PlatformSpecific {
-                application_id: icon::APP_ID.into(),
-                ..Default::default()
-            },
-            ..Default::default()
-        })
+        .font(include_bytes!("../../../assets/fonts/Poppins-Regular.ttf").as_slice())
+        .font(include_bytes!("../../../assets/fonts/Poppins-Medium.ttf").as_slice())
+        .font(include_bytes!("../../../assets/fonts/Poppins-SemiBold.ttf").as_slice())
+        .font(include_bytes!("../../../assets/fonts/lucide.ttf").as_slice())
+        .default_font(Font::with_name("Poppins"))
         .run()
+}
+
+fn main_window_settings() -> window::Settings {
+    window::Settings {
+        size: iced::Size::new(1000.0, 700.0),
+        min_size: Some(iced::Size::new(760.0, 520.0)),
+        icon: icon::window_icon(),
+        #[cfg(target_os = "linux")]
+        platform_specific: window::settings::PlatformSpecific { application_id: icon::APP_ID.into(), ..Default::default() },
+        ..Default::default()
+    }
+}
+
+/// Tray menu picks, from the tray's thread to the app.
+type TrayChannel = (UnboundedSender<TrayAction>, Mutex<Option<UnboundedReceiver<TrayAction>>>);
+
+fn tray_channel() -> &'static TrayChannel {
+    static CHANNEL: OnceLock<TrayChannel> = OnceLock::new();
+    CHANNEL.get_or_init(|| {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (tx, Mutex::new(Some(rx)))
+    })
+}
+
+fn tray_events() -> impl Stream<Item = Message> {
+    iced::stream::channel(16, async |mut out| {
+        let Some(mut rx) = tray_channel().1.lock().unwrap().take() else { return };
+        while let Some(action) = rx.recv().await {
+            if out.send(Message::Tray(action)).await.is_err() {
+                break;
+            }
+        }
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -141,6 +178,12 @@ pub struct App {
     pub addresses: Vec<LocalAddress>,
     /// The "pair by address" field.
     pub pair_address: String,
+    /// The main window, while it's open.
+    pub main_window: Option<window::Id>,
+    tray: Option<TrayHandle>,
+    tray_state: TrayState,
+    /// Told the user once that closing the window keeps dextr in the tray.
+    told_about_tray: bool,
 }
 
 /// The editable copy of the settings.
@@ -193,6 +236,11 @@ impl Form {
 #[derive(Debug, Clone)]
 pub enum Setting {
     Arrange(Link),
+    Layout(DisplayLayout),
+    MouseEnabled(bool),
+    KeyboardEnabled(bool),
+    /// A per-device rule: `outgoing` is from this device to `device`.
+    Rule { device: String, outgoing: bool, channel: Channel, on: bool },
     DeadCorners(u32),
     SwitchDelay(u32),
     PointerSpeed(f32),
@@ -230,6 +278,19 @@ impl Setting {
                 c.peer_side = l.side;
                 c.peer_offset = l.offset;
             }
+            Setting::Layout(layout) => {
+                c.layout = layout;
+                // Proportional is a horizontal row: other device left or right.
+                if layout == DisplayLayout::Proportional && !c.peer_side.is_horizontal() {
+                    c.peer_side = Side::Right;
+                }
+            }
+            Setting::MouseEnabled(v) => c.mouse.enabled = v,
+            Setting::KeyboardEnabled(v) => c.keyboard.enabled = v,
+            Setting::Rule { device, outgoing, channel, on } => {
+                let rules = c.devices.entry(device).or_default();
+                if outgoing { rules.send.set(channel, on) } else { rules.receive.set(channel, on) }
+            }
             Setting::DeadCorners(v) => c.switching.dead_corners = v,
             Setting::SwitchDelay(v) => c.switching.delay_ms = v,
             Setting::PointerSpeed(v) => c.mouse.speed = v,
@@ -252,6 +313,11 @@ impl Setting {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    MainOpened(window::Id),
+    /// Test only (`DEXTR_TEST_SCREENSHOT`): save the window's pixels.
+    Screenshot(window::Screenshot),
+    WindowGone(window::Id),
+    Tray(TrayAction),
     EngineStarted(UnboundedSender<Command>),
     Engine(Box<Event>),
     Navigate(Page),
@@ -291,11 +357,56 @@ fn engine_events() -> impl Stream<Item = Message> {
 }
 
 impl App {
-    fn new() -> Self {
-        Self { launch_at_login: autostart::enabled(), ..Self::default() }
+    fn boot(hidden: bool) -> (Self, Task<Message>) {
+        let mut app = Self { launch_at_login: autostart::enabled(), ..Self::default() };
+        let task = if hidden { Task::none() } else { app.open_main() };
+        (app, task)
     }
 
-    fn title(&self) -> String {
+    /// Opens the main window, or brings it to the front.
+    fn open_main(&mut self) -> Task<Message> {
+        if let Some(id) = self.main_window {
+            return window::gain_focus(id);
+        }
+        let (id, open) = window::open(main_window_settings());
+        self.main_window = Some(id);
+        open.map(Message::MainOpened)
+    }
+
+    /// One line for the tray: who we're connected to and what's happening.
+    fn status_line(&self) -> String {
+        match (&self.peer, self.mode) {
+            (Some(p), Some(Mode::Controlling)) => format!("Controlling {}", p.name),
+            (Some(p), Some(Mode::Controlled)) => format!("{} is controlling this device", p.name),
+            (Some(p), _) if self.paused => format!("Connected to {} · paused", p.name),
+            (Some(p), _) => format!("Connected to {}", p.name),
+            (None, _) if self.connecting => "Connecting…".into(),
+            (None, _) if self.reconnect_in.is_some() => "Reconnecting…".into(),
+            (None, _) => "Not connected".into(),
+        }
+    }
+
+    /// Starts the tray icon (main thread, event loop running) or updates it.
+    fn sync_tray(&mut self) {
+        let state = TrayState { status: self.status_line(), paused: self.paused };
+        if state == self.tray_state && self.tray.is_some() {
+            return;
+        }
+        self.tray_state = state.clone();
+        match &self.tray {
+            Some(tray) => tray.update(state),
+            None => match dextr_platform::tray::start_tray(tray_channel().0.clone(), state) {
+                Ok(tray) => self.tray = Some(tray),
+                Err(e) => {
+                    // No tray on this desktop: closing the window quits.
+                    tracing::info!("no tray icon: {e:#}");
+                    self.tray_state.status = String::from("unavailable");
+                }
+            },
+        }
+    }
+
+    fn title(&self, _window: window::Id) -> String {
         match (&self.peer, self.mode) {
             (Some(p), Some(Mode::Controlling)) => format!("dextr — controlling {}", p.name),
             (Some(p), _) => format!("dextr — connected to {}", p.name),
@@ -303,7 +414,7 @@ impl App {
         }
     }
 
-    fn theme(&self) -> Option<Theme> {
+    fn theme(&self, _window: window::Id) -> Option<Theme> {
         match self.form.config.appearance {
             Appearance::System => None,
             Appearance::Light => Some(Theme::Light),
@@ -312,7 +423,11 @@ impl App {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        Subscription::run(engine_events)
+        Subscription::batch([
+            Subscription::run(engine_events),
+            Subscription::run(tray_events),
+            window::close_events().map(Message::WindowGone),
+        ])
     }
 
     fn push_log(&mut self, line: impl Into<String>) {
@@ -379,10 +494,55 @@ impl App {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        let task = self.handle(message);
+        // Start or refresh the tray once the engine is up (main thread).
+        if self.engine.is_some() && self.tray_state.status != "unavailable" {
+            self.sync_tray();
+        }
+        task
+    }
+
+    fn handle(&mut self, message: Message) -> Task<Message> {
         if !matches!(message, Message::Arm(_) | Message::Confirm(_) | Message::Engine(_)) {
             self.confirm = None;
         }
         match message {
+            Message::MainOpened(id) => {
+                // Test only: open a page and save a screenshot of it.
+                if let Ok(page) = std::env::var("DEXTR_TEST_PAGE") {
+                    self.page = Page::ALL.into_iter().find(|p| p.label().eq_ignore_ascii_case(&page)).unwrap_or(self.page);
+                }
+                if std::env::var_os("DEXTR_TEST_SCREENSHOT").is_some() {
+                    return Task::future(tokio::time::sleep(std::time::Duration::from_secs(3)))
+                        .then(move |()| window::screenshot(id))
+                        .map(Message::Screenshot);
+                }
+            }
+            Message::Screenshot(shot) => {
+                if let Some(path) = std::env::var_os("DEXTR_TEST_SCREENSHOT") {
+                    let mut ppm = format!("P6\n{} {}\n255\n", shot.size.width, shot.size.height).into_bytes();
+                    ppm.extend(shot.rgba.as_chunks::<4>().0.iter().flat_map(|p| [p[0], p[1], p[2]]));
+                    let _ = std::fs::write(path, ppm);
+                }
+            }
+            Message::WindowGone(id) => {
+                if Some(id) == self.main_window {
+                    self.main_window = None;
+                    if self.tray.is_none() {
+                        return iced::exit();
+                    }
+                    if !self.told_about_tray {
+                        self.told_about_tray = true;
+                        self.push_log("dextr keeps running in the tray. Use the tray icon to open it or quit.");
+                    }
+                }
+            }
+            Message::Tray(TrayAction::Open) => return self.open_main(),
+            Message::Tray(TrayAction::SetPaused(paused)) => {
+                self.paused = paused;
+                self.send(Command::SetPaused(paused));
+            }
+            Message::Tray(TrayAction::Quit) => return iced::exit(),
             Message::EngineStarted(tx) => {
                 self.engine = Some(tx);
                 // The app is running now (main thread): give it its Dock icon.
@@ -590,7 +750,7 @@ impl App {
         Task::none()
     }
 
-    fn view(&self) -> iced::Element<'_, Message> {
+    fn view(&self, _window: window::Id) -> iced::Element<'_, Message> {
         pages::view(self)
     }
 }

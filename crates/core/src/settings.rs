@@ -75,6 +75,8 @@ impl Default for SwitchingSettings {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct MouseSettings {
+    /// Master switch: share this mouse with other devices at all.
+    pub enabled: bool,
     /// Multiplies pointer movement on the other device.
     pub speed: f32,
     /// Multiplies scrolling on the other device.
@@ -87,7 +89,7 @@ pub struct MouseSettings {
 
 impl Default for MouseSettings {
     fn default() -> Self {
-        Self { speed: 1.0, scroll_speed: 1.0, natural_scroll: false, swap_buttons: false }
+        Self { enabled: true, speed: 1.0, scroll_speed: 1.0, natural_scroll: false, swap_buttons: false }
     }
 }
 
@@ -123,11 +125,19 @@ impl ReturnShortcut {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct KeyboardSettings {
+    /// Master switch: send this keyboard to other devices at all.
+    pub enabled: bool,
     pub modifiers: ModifierMap,
     pub return_shortcut: ReturnShortcut,
+}
+
+impl Default for KeyboardSettings {
+    fn default() -> Self {
+        Self { enabled: true, modifiers: ModifierMap::default(), return_shortcut: ReturnShortcut::default() }
+    }
 }
 
 impl KeyboardSettings {
@@ -162,7 +172,72 @@ impl KeyboardSettings {
     }
 }
 
+// ── Displays ─────────────────────────────────────────────────────────
+
+choice!(
+    /// How the two devices' screens are arranged and where the pointer crosses.
+    DisplayLayout {
+        Exact => "Exact",
+        Proportional => "Proportional",
+    } default Exact
+);
+
 // ── Clipboard ────────────────────────────────────────────────────────
+
+// ── Per device ───────────────────────────────────────────────────────────
+
+/// What goes one way between this device and another.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(default)]
+pub struct Direction {
+    pub mouse: bool,
+    pub keyboard: bool,
+    pub clipboard: bool,
+}
+
+impl Default for Direction {
+    fn default() -> Self {
+        Self { mouse: true, keyboard: true, clipboard: true }
+    }
+}
+
+/// Rules for one paired device, in each direction.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(default)]
+pub struct DeviceRules {
+    /// Its name, as last seen.
+    pub name: String,
+    /// From this device to it.
+    pub send: Direction,
+    /// From it to this device.
+    pub receive: Direction,
+}
+
+/// Which input a rule is about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Channel {
+    Mouse,
+    Keyboard,
+    Clipboard,
+}
+
+impl Direction {
+    pub fn get(&self, channel: Channel) -> bool {
+        match channel {
+            Channel::Mouse => self.mouse,
+            Channel::Keyboard => self.keyboard,
+            Channel::Clipboard => self.clipboard,
+        }
+    }
+
+    pub fn set(&mut self, channel: Channel, on: bool) {
+        match channel {
+            Channel::Mouse => self.mouse = on,
+            Channel::Keyboard => self.keyboard = on,
+            Channel::Clipboard => self.clipboard = on,
+        }
+    }
+}
 
 /// Sharing the clipboard with the other device.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

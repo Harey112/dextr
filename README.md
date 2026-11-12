@@ -18,6 +18,7 @@ Share one mouse, keyboard and clipboard between computers, in any direction, wri
 | Control the peer (capture) | ✅ InputCapture portal + libei | 🧪 Quartz event tap | ⏳ Raw Input + hook |
 | Be controlled (inject) | ✅ RemoteDesktop portal + libei | 🧪 CGEventPost | ⏳ SendInput |
 | Launch at login | ✅ autostart entry | 🧪 LaunchAgent | ⏳ |
+| Tray icon, runs in the background | ✅ StatusNotifierItem | 🧪 menu bar (tray-icon) | 🧪 notification area |
 | Clipboard (text, images) | ✅ Wayland data-control (KDE Plasma, wlroots) | 🧪 NSPasteboard | ⏳ |
 
 ✅ works · 🧪 written, compiles for macOS, not yet tested on a Mac · ⏳ not started
@@ -26,6 +27,11 @@ Linux needs a desktop whose portal has InputCapture: KDE Plasma 6.1+ or GNOME 45
 No `input` group or `/dev/input` access is used.
 
 macOS media keys (volume, play) are not forwarded to a Mac yet.
+
+## Fonts
+
+The app uses [Poppins](https://github.com/itfoundry/Poppins) (SIL Open Font License, `assets/fonts/Poppins-OFL.txt`)
+and the [Lucide](https://lucide.dev) icon font (ISC, `assets/fonts/Lucide-LICENSE.txt`), built into the binary.
 
 ## Icon
 
@@ -95,6 +101,34 @@ Discovery broadcasts carry only a name, OS, port and fingerprint.
 
 Settings and the device certificate live in `~/.config/dextr/` on Linux and
 `~/Library/Application Support/dev.dextr.dextr/` on macOS.
+
+## Running in the background
+
+Closing the window keeps dextr running; its tray icon reopens it, shows the connection, pauses
+sharing, or quits. **Launch at login** starts it in the tray without a window (`dextr --hidden`).
+
+* **Linux:** the StatusNotifierItem tray protocol, in pure Rust (no GTK or system libraries). Shown
+  by KDE Plasma, Xfce, Cinnamon, MATE, LXQt, Budgie and wlroots bars; on GNOME with the AppIndicator
+  extension (built in on Ubuntu and Fedora). With no tray at all, closing the window quits as before.
+* **macOS / Windows:** the native menu bar or notification area.
+
+## Displays: Exact or Proportional
+
+* **Exact** (default): real sizes, like the system display settings. Place the other device on any
+  side and slide it along; the pointer crosses only where the edges touch, at the same pixel.
+* **Proportional:** both devices' screens in one flat row, all the same height. The whole edge maps to
+  the whole edge: leaving 30% of the way down yours enters 30% of the way down theirs, whatever the
+  sizes, so there are no dead zones. The edge is the outermost screen on that side.
+
+The arrangement, including the mode, is the same on both devices.
+
+## What goes where
+
+The **Mouse**, **Keyboard** and **Clipboard** pages each have a main switch, and a **Devices** list with
+a switch per direction for every paired device (this device → it, and it → this device). Both the
+main switch and the device's switch must be on. Turning the mouse off keeps the pointer (and so the
+keyboard) on this device; turning the keyboard off keeps keys from being sent while the pointer is
+over there.
 
 ## Clipboard
 

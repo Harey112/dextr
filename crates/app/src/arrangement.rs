@@ -67,8 +67,35 @@ impl Layout {
     }
 }
 
+/// Proportional: the screens of one device side by side in a row, in their
+/// left-to-right order, each scaled to height 1. Returns (x, width) per
+/// screen in the original order, and the row's width.
+fn row(screens: &[Rect]) -> (Vec<(f32, f32)>, f32) {
+    const GAP: f32 = 0.05;
+    let mut order: Vec<usize> = (0..screens.len()).collect();
+    order.sort_by_key(|&i| (screens[i].x, screens[i].y));
+    let mut out = vec![(0.0, 0.0); screens.len()];
+    let mut x = 0.0;
+    for (n, &i) in order.iter().enumerate() {
+        if n > 0 {
+            x += GAP;
+        }
+        let w = screens[i].w as f32 / screens[i].h.max(1) as f32;
+        out[i] = (x, w);
+        x += w;
+    }
+    (out, x)
+}
+
 impl<M> Arrangement<'_, M> {
     fn layout(&self, size: Size) -> Layout {
+        self.layout_for(self.link, size)
+    }
+
+    fn layout_for(&self, link: Link, size: Size) -> Layout {
+        if link.proportional {
+            return self.row_layout(link.side, size);
+        }
         let local = if self.local.is_empty() { vec![PLACEHOLDER] } else { self.local.to_vec() };
         let ob = Rect::bounds(&local).unwrap();
         let peer = self.peer.filter(|p| !p.is_empty());
@@ -79,7 +106,7 @@ impl<M> Arrangement<'_, M> {
         let (mut x1, mut y1) = (ob.right(), ob.bottom());
         let mut place = (0, 0);
         if let Some(tb) = tb {
-            place = self.link.place(ob, tb);
+            place = link.place(ob, tb);
             x0 = x0.min(place.0 as f32);
             y0 = y0.min(place.1 as f32);
             x1 = x1.max((place.0 + tb.w as i32) as f32);
@@ -108,13 +135,57 @@ impl<M> Arrangement<'_, M> {
         if let (Some(peer), Some(tb)) = (peer, tb) {
             let (dx, dy) = ((place.0 - tb.x) as f32, (place.1 - tb.y) as f32);
             layout.peer = peer.iter().map(|r| layout.to_canvas(r.x as f32 + dx, r.y as f32 + dy, r.w as f32, r.h as f32)).collect();
-            layout.peer_bounds = layout.peer_rect(self.link);
+            layout.peer_bounds = layout.peer_rect(link);
+        }
+        layout
+    }
+
+    /// Proportional: both devices' screens in one flat row, all the same
+    /// height, the other device on the left or right.
+    fn row_layout(&self, side: Side, size: Size) -> Layout {
+        let local = if self.local.is_empty() { vec![PLACEHOLDER] } else { self.local.to_vec() };
+        let peer = self.peer.filter(|p| !p.is_empty()).map(<[Rect]>::to_vec);
+        let (local_row, local_w) = row(&local);
+        let peer_row = peer.as_deref().map(row);
+        const BETWEEN: f32 = 0.18;
+
+        let total = local_w + peer_row.as_ref().map_or(0.0, |(_, w)| BETWEEN + w);
+        let fill = if peer.is_some() { 0.88 } else { 0.5 };
+        let scale = (size.width * fill / total).min(size.height * 0.62);
+        let left = (size.width - total * scale) / 2.0;
+        let top = (size.height - scale) / 2.0 + 8.0;
+        let (local_x, peer_x) = match side {
+            Side::Left => (left + peer_row.as_ref().map_or(0.0, |(_, w)| (w + BETWEEN) * scale), left),
+            _ => (left, left + (local_w + BETWEEN) * scale),
+        };
+        let place = |x0: f32, (x, w): (f32, f32)| Rectangle::new(Point::new(x0 + x * scale, top), Size::new(w * scale, scale));
+
+        let mut layout = Layout {
+            local: local_row.iter().map(|&r| place(local_x, r)).collect(),
+            peer: Vec::new(),
+            local_bounds: Rectangle::new(Point::new(local_x, top), Size::new(local_w * scale, scale)),
+            peer_bounds: None,
+            ob: Rect::bounds(&local).unwrap(),
+            tb: peer.as_deref().and_then(Rect::bounds),
+            origin: Point::ORIGIN,
+            scale: 1.0,
+        };
+        if let Some((peer_row, peer_w)) = peer_row {
+            layout.peer = peer_row.iter().map(|&r| place(peer_x, r)).collect();
+            layout.peer_bounds = Some(Rectangle::new(Point::new(peer_x, top), Size::new(peer_w * scale, scale)));
         }
         layout
     }
 
     /// Placement for the peer group dropped with its top-left at `top_left`.
-    fn link_at(layout: &Layout, top_left: Point) -> Option<Link> {
+    fn link_at(&self, layout: &Layout, top_left: Point) -> Option<Link> {
+        if self.link.proportional {
+            // Left or right of this device's row, whichever is nearer.
+            let peer = layout.peer_bounds?;
+            let center = top_left.x + peer.width / 2.0;
+            let side = if center < layout.local_bounds.center_x() { Side::Left } else { Side::Right };
+            return Some(Link { side, offset: None, proportional: true });
+        }
         let (ob, tb) = (layout.ob, layout.tb?);
         let (x, y) = layout.to_world(top_left);
 
@@ -138,10 +209,10 @@ impl<M> Arrangement<'_, M> {
         let snap = ol.max(tl) as f32 * SNAP;
         let candidates = [((ol - tl) / 2, None), (0, Some(0)), (ol - tl, Some(ol - tl))];
         if let Some(&(_, offset)) = candidates.iter().find(|(at, _)| (start - *at as f32).abs() <= snap) {
-            return Some(Link { side, offset });
+            return Some(Link { side, offset, proportional: false });
         }
-        let free = Link { side, offset: Some(start.round() as i32) };
-        Some(Link { side, offset: Some(free.offset_for(ob, tb)) })
+        let free = Link { side, offset: Some(start.round() as i32), proportional: false };
+        Some(Link { side, offset: Some(free.offset_for(ob, tb)), proportional: false })
     }
 }
 
@@ -216,7 +287,7 @@ impl<M> canvas::Program<M> for Arrangement<'_, M> {
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
                 state.grab.take()?;
                 let top_left = state.drag_at.take()?;
-                let link = Self::link_at(&layout, top_left)?;
+                let link = self.link_at(&layout, top_left)?;
                 Some(Action::publish(on_change(link)).and_capture())
             }
             _ => None,
@@ -253,9 +324,14 @@ impl<M> canvas::Program<M> for Arrangement<'_, M> {
         };
 
         // While dragging, show where the screens will snap to.
-        let target = state.drag_at.and_then(|at| Self::link_at(&layout, at)).unwrap_or(self.link);
+        let target = state.drag_at.and_then(|at| self.link_at(&layout, at)).unwrap_or(self.link);
+        let target_layout = target.proportional.then(|| self.layout_for(target, bounds.size()));
+        let target_rect = match &target_layout {
+            Some(l) => l.peer_bounds,
+            None => layout.peer_rect(target),
+        };
         if state.drag_at.is_some()
-            && let Some(r) = layout.peer_rect(target)
+            && let Some(r) = target_rect
         {
             let path = Path::rounded_rectangle(r.position(), r.size(), 6.0.into());
             let mut stroke = Stroke::default().with_color(palette.success.strong.color).with_width(2.0);
@@ -264,8 +340,22 @@ impl<M> canvas::Program<M> for Arrangement<'_, M> {
         }
 
         // The part of the edge the pointer crosses.
-        if let Some(p) = layout.peer_rect(target) {
-            let (a, b) = shared_edge(target.side, layout.local_bounds, p);
+        let edge = match &target_layout {
+            // Proportional: the whole outer edge of this device's row.
+            Some(l) => {
+                let outer = if target.side == Side::Left {
+                    l.local.iter().copied().min_by(|a, b| a.x.total_cmp(&b.x))
+                } else {
+                    l.local.iter().copied().max_by(|a, b| (a.x + a.width).total_cmp(&(b.x + b.width)))
+                };
+                outer.map(|r| {
+                    let x = if target.side == Side::Left { r.x } else { r.x + r.width };
+                    (Point::new(x, r.y), Point::new(x, r.y + r.height))
+                })
+            }
+            None => target_rect.map(|p| shared_edge(target.side, layout.local_bounds, p)),
+        };
+        if let Some((a, b)) = edge {
             frame.stroke(&Path::line(a, b), Stroke::default().with_color(palette.success.base.color).with_width(4.0));
         }
 

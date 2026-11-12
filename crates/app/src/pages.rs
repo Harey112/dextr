@@ -1,18 +1,67 @@
 use dextr_core::{
-    PairingState,
+    Mode, PairingState,
     edge::Link,
-    Mode,
-    settings::{Appearance, ModifierMap, ReturnShortcut},
+    settings::{Appearance, Channel, DisplayLayout, ModifierMap, ReturnShortcut},
 };
 use dextr_proto::{DEFAULT_PORT, Os, Rect, Side};
 use iced::{
-    Alignment, Background, Border, Element, Font, Length, Theme,
+    Alignment, Background, Border, Color, Element, Font, Length, Theme,
     widget::{
-        button, canvas, column, container, pick_list, row, scrollable, slider, space, text, text_input, toggler,
+        button, canvas, column, container, pick_list, row, scrollable, slider, space, text, text_input, toggler, tooltip,
     },
 };
 
 use crate::{Access, App, Danger, Message, Page, Setting, arrangement::Arrangement, autostart, os_name};
+
+// ── Type and icons ───────────────────────────────────────────────────────
+
+const MEDIUM: Font = Font { weight: iced::font::Weight::Medium, ..Font::with_name("Poppins") };
+const SEMIBOLD: Font = Font { weight: iced::font::Weight::Semibold, ..Font::with_name("Poppins") };
+const ICONS: Font = Font::with_name("lucide");
+
+/// Lucide icon code points.
+mod ic {
+    pub const OVERVIEW: char = '\u{e1c1}';
+    pub const DISPLAYS: char = '\u{e11d}';
+    pub const PAIRING: char = '\u{e102}';
+    pub const MOUSE: char = '\u{e28e}';
+    pub const KEYBOARD: char = '\u{e284}';
+    pub const CLIPBOARD: char = '\u{e085}';
+    pub const ACTIVITY: char = '\u{e038}';
+    pub const SETTINGS: char = '\u{e154}';
+    pub const HELP: char = '\u{e082}';
+    pub const PLUG: char = '\u{e37f}';
+    pub const UNPLUG: char = '\u{e45d}';
+    pub const COPY: char = '\u{e09e}';
+    pub const TRASH: char = '\u{e18e}';
+    pub const REFRESH: char = '\u{e145}';
+    pub const LAPTOP: char = '\u{e1cd}';
+    pub const POINTER: char = '\u{e1c3}';
+    pub const SHIELD: char = '\u{e1ff}';
+    pub const PALETTE: char = '\u{e1dd}';
+    pub const FOLDER: char = '\u{e247}';
+    pub const ROTATE: char = '\u{e148}';
+    pub const RADAR: char = '\u{e497}';
+    pub const NETWORK: char = '\u{e125}';
+    pub const SCROLL: char = '\u{e2ed}';
+    pub const TO: char = '\u{e049}';
+    pub const SLIDERS: char = '\u{e29a}';
+    pub const ROCKET: char = '\u{e286}';
+    pub const INFO: char = '\u{e0f9}';
+    pub const COMMAND: char = '\u{e09a}';
+    pub const ZAP: char = '\u{e1b4}';
+    pub const FINGERPRINT: char = '\u{e2cb}';
+    pub const CHECK: char = '\u{e06c}';
+}
+
+fn icon<'a>(code: char) -> text::Text<'a> {
+    text(code.to_string()).font(ICONS).size(16).line_height(1.0)
+}
+
+/// A label with an icon in front.
+fn with_icon<'a>(code: char, label: impl text::IntoFragment<'a>) -> Element<'a, Message> {
+    row![icon(code), text(label)].spacing(8).align_y(Alignment::Center).into()
+}
 
 // ── Building blocks ──────────────────────────────────────────────────────
 
@@ -26,7 +75,7 @@ enum Tone {
 }
 
 fn chip<'a>(label: impl text::IntoFragment<'a>, tone: Tone) -> Element<'a, Message> {
-    container(text(label).size(12))
+    container(text(label).size(12).font(MEDIUM))
         .padding([3, 10])
         .style(move |theme: &Theme| {
             let p = theme.extended_palette();
@@ -47,31 +96,102 @@ fn chip<'a>(label: impl text::IntoFragment<'a>, tone: Tone) -> Element<'a, Messa
         .into()
 }
 
-const SEMIBOLD: Font = Font { weight: iced::font::Weight::Semibold, ..Font::DEFAULT };
-
-fn card<'a>(title: &'a str, body: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
-    container(column![text(title).size(15).font(SEMIBOLD), body.into()].spacing(14))
-        .padding(18)
-        .width(Length::Fill)
-        .style(|theme: &Theme| {
-            let p = theme.extended_palette();
-            container::Style {
-                background: Some(Background::Color(p.background.weaker.color)),
-                border: Border { radius: 10.0.into(), width: 1.0, color: p.background.weak.color },
-                ..container::Style::default()
-            }
-        })
-        .into()
-}
-
 fn muted<'a>(content: impl text::IntoFragment<'a>) -> text::Text<'a> {
     text(content).size(13).style(|theme: &Theme| text::Style {
         color: Some(theme.extended_palette().background.strong.text.scale_alpha(0.75)),
     })
 }
 
-fn heading<'a>(title: &'a str, subtitle: &'a str) -> Element<'a, Message> {
-    column![text(title).size(24), muted(subtitle)].spacing(4).into()
+/// A help circle: hover (or focus) to read `description`.
+fn help<'a>(description: impl text::IntoFragment<'a>) -> Element<'a, Message> {
+    let mark = icon(ic::HELP).size(14).style(|theme: &Theme| text::Style {
+        color: Some(theme.extended_palette().background.strong.text.scale_alpha(0.55)),
+    });
+    tooltip(
+        mark,
+        container(text(description).size(12)).padding([8, 12]).max_width(300).style(|theme: &Theme| {
+            let p = theme.extended_palette();
+            container::Style {
+                background: Some(Background::Color(p.background.base.color)),
+                text_color: Some(p.background.base.text),
+                border: Border { radius: 8.0.into(), width: 1.0, color: p.background.strong.color },
+                shadow: iced::Shadow { color: Color::BLACK.scale_alpha(0.18), offset: iced::Vector::new(0.0, 4.0), blur_radius: 14.0 },
+                ..container::Style::default()
+            }
+        }),
+        tooltip::Position::Top,
+    )
+    .gap(6)
+    .into()
+}
+
+/// A card: icon and title on top, optional help, then the body.
+fn card<'a>(code: char, title: &'a str, body: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    card_with(code, title, None, body)
+}
+
+fn card_help<'a>(code: char, title: &'a str, help_text: &'a str, body: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    card_with(code, title, Some(help_text), body)
+}
+
+fn card_with<'a>(code: char, title: &'a str, help_text: Option<&'a str>, body: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    let mut header = row![
+        icon(code).size(17).style(|theme: &Theme| text::Style { color: Some(theme.extended_palette().primary.base.color) }),
+        text(title).size(15).font(SEMIBOLD),
+    ]
+    .spacing(9)
+    .align_y(Alignment::Center);
+    if let Some(h) = help_text {
+        header = header.push(help(h));
+    }
+    container(column![header, body.into()].spacing(16))
+        .padding(20)
+        .width(Length::Fill)
+        .style(|theme: &Theme| {
+            let p = theme.extended_palette();
+            container::Style {
+                background: Some(Background::Color(p.background.weaker.color)),
+                border: Border { radius: 12.0.into(), width: 1.0, color: p.background.weak.color },
+                ..container::Style::default()
+            }
+        })
+        .into()
+}
+
+/// Page title with an optional master switch on the right.
+fn heading<'a>(code: char, title: &'a str, subtitle: &'a str, master: Option<Element<'a, Message>>) -> Element<'a, Message> {
+    let titles = column![
+        row![icon(code).size(24), text(title).size(26).font(SEMIBOLD)].spacing(12).align_y(Alignment::Center),
+        muted(subtitle).size(14),
+    ]
+    .spacing(4)
+    .width(Length::Fill);
+    let mut r = row![titles].spacing(16).align_y(Alignment::Center);
+    if let Some(m) = master {
+        r = r.push(m);
+    }
+    r.into()
+}
+
+/// The big on/off switch of a page.
+fn master<'a>(label: &'a str, on: bool, f: fn(bool) -> Setting) -> Element<'a, Message> {
+    container(
+        row![text(label).size(14).font(MEDIUM), toggler(on).size(22).on_toggle(move |v| Message::Set(f(v)))]
+            .spacing(12)
+            .align_y(Alignment::Center),
+    )
+    .padding([10, 16])
+    .style(move |theme: &Theme| {
+        let p = theme.extended_palette();
+        let pair = if on { p.success.weak } else { p.background.strong };
+        container::Style {
+            background: Some(Background::Color(pair.color)),
+            text_color: Some(pair.text),
+            border: Border { radius: 22.0.into(), ..Border::default() },
+            ..container::Style::default()
+        }
+    })
+    .into()
 }
 
 fn keycap(label: &str) -> Element<'_, Message> {
@@ -82,13 +202,13 @@ fn keycap(label: &str) -> Element<'_, Message> {
 }
 
 fn field<'a>(label: &'a str, input: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
-    column![text(label).size(13), input.into()].spacing(6).into()
+    column![text(label).size(13).font(MEDIUM), input.into()].spacing(6).into()
 }
 
-/// A labeled setting row: title and description on the left, control on the right.
+/// A setting row: name and help circle on the left, control on the right.
 fn setting<'a>(title: &'a str, description: &'a str, control: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
     row![
-        column![text(title).size(14), muted(description).size(12)].spacing(2).width(Length::Fill),
+        row![text(title).size(14), help(description)].spacing(6).align_y(Alignment::Center).width(Length::Fill),
         control.into(),
     ]
     .spacing(16)
@@ -134,7 +254,7 @@ fn settings_list<'a>(items: Vec<Element<'a, Message>>) -> Element<'a, Message> {
 }
 
 fn banner<'a>(content: impl Into<Element<'a, Message>>, tone: Tone) -> container::Container<'a, Message> {
-    container(content).padding([10, 14]).width(Length::Fill).style(move |theme: &Theme| {
+    container(content).padding([12, 16]).width(Length::Fill).style(move |theme: &Theme| {
         let p = theme.extended_palette();
         let pair = match tone {
             Tone::Bad => p.danger.weak,
@@ -144,7 +264,7 @@ fn banner<'a>(content: impl Into<Element<'a, Message>>, tone: Tone) -> container
         container::Style {
             background: Some(Background::Color(pair.color)),
             text_color: Some(pair.text),
-            border: Border { radius: 8.0.into(), ..Border::default() },
+            border: Border { radius: 10.0.into(), ..Border::default() },
             ..container::Style::default()
         }
     })
@@ -164,17 +284,22 @@ fn mode_chip(app: &App) -> Element<'_, Message> {
 }
 
 fn connect_button(app: &App) -> button::Button<'_, Message> {
+    let label = |code, s| container(with_icon(code, s)).center_x(Length::Fill);
     if app.peer.is_some() {
-        button(text("Disconnect").center().width(Length::Fill)).style(button::secondary).on_press(Message::Disconnect)
+        button(label(ic::UNPLUG, "Disconnect")).style(button::secondary).on_press(Message::Disconnect)
     } else if app.connecting {
-        button(text("Connecting…").center().width(Length::Fill)).style(button::secondary)
+        button(label(ic::PLUG, "Connecting…")).style(button::secondary)
     } else if app.reconnect_in.is_some() {
-        button(text("Stop reconnecting").center().width(Length::Fill)).style(button::secondary).on_press(Message::Disconnect)
+        button(label(ic::UNPLUG, "Stop reconnecting")).style(button::secondary).on_press(Message::Disconnect)
     } else {
-        button(text("Connect").center().width(Length::Fill))
+        button(label(ic::PLUG, "Connect"))
             .style(button::primary)
             .on_press_maybe(app.saved.is_some().then_some(Message::Connect))
     }
+}
+
+fn icon_button<'a>(code: char, label: &'a str, message: Message) -> button::Button<'a, Message> {
+    button(with_icon(code, label)).style(button::secondary).on_press(message)
 }
 
 /// A destructive action with a second click to confirm.
@@ -196,6 +321,10 @@ fn side_word(side: Side) -> String {
     side.to_string().to_lowercase()
 }
 
+fn this_name(app: &App) -> &str {
+    app.saved.as_ref().map(|c| c.device_name.as_str()).unwrap_or("This device")
+}
+
 // ── Layout ───────────────────────────────────────────────────────────────
 
 pub fn view(app: &App) -> Element<'_, Message> {
@@ -210,40 +339,50 @@ pub fn view(app: &App) -> Element<'_, Message> {
         Page::Settings => settings(app),
     };
 
-    let mut content = column![].spacing(16).max_width(780);
+    let mut content = column![].spacing(18).max_width(800);
     if let Some(notice) = &app.notice {
-        content = content.push(
-            banner(
-                row![text(notice).size(13).width(Length::Fill), button("Dismiss").style(button::text).on_press(Message::DismissNotice)]
-                    .spacing(12)
-                    .align_y(Alignment::Center),
-                Tone::Warn,
-            ),
-        );
+        content = content.push(banner(
+            row![text(notice).size(13).width(Length::Fill), button("Dismiss").style(button::text).on_press(Message::DismissNotice)]
+                .spacing(12)
+                .align_y(Alignment::Center),
+            Tone::Warn,
+        ));
     }
     content = content.push(page);
 
-    let body = scrollable(container(content).padding(28).width(Length::Fill).center_x(Length::Fill))
+    let body = scrollable(container(content).padding([28, 32]).width(Length::Fill).center_x(Length::Fill))
         .height(Length::Fill)
         .width(Length::Fill);
 
     row![sidebar(app), body].into()
 }
 
+fn page_icon(p: Page) -> char {
+    match p {
+        Page::Overview => ic::OVERVIEW,
+        Page::Displays => ic::DISPLAYS,
+        Page::Pairing => ic::PAIRING,
+        Page::Mouse => ic::MOUSE,
+        Page::Keyboard => ic::KEYBOARD,
+        Page::Clipboard => ic::CLIPBOARD,
+        Page::Activity => ic::ACTIVITY,
+        Page::Settings => ic::SETTINGS,
+    }
+}
+
 fn sidebar(app: &App) -> Element<'_, Message> {
     let nav = column(Page::ALL.iter().map(|&p| {
-        let label: Element<'_, Message> = text(p.label()).size(14).into();
-        button(label)
+        button(row![icon(page_icon(p)).size(17), text(p.label()).size(14)].spacing(12).align_y(Alignment::Center))
             .width(Length::Fill)
-            .padding([8, 12])
+            .padding([9, 12])
             .style(if app.page == p { button::primary } else { button::text })
             .on_press(Message::Navigate(p))
             .into()
     }))
-    .spacing(3);
+    .spacing(2);
 
     let peer_line: Element<'_, Message> = match (&app.peer, app.reconnect_in) {
-        (Some(p), _) => column![text(&p.name).size(13), muted(format!("{} · {}", os_name(p.os), p.address)).size(12)]
+        (Some(p), _) => column![text(&p.name).size(13).font(MEDIUM), muted(format!("{} · {}", os_name(p.os), p.address)).size(12)]
             .spacing(2)
             .into(),
         (None, Some(secs)) => muted(format!("Retrying in {secs} s…")).size(12).into(),
@@ -252,17 +391,17 @@ fn sidebar(app: &App) -> Element<'_, Message> {
 
     container(
         column![
-            row![text("dextr").size(22), space::horizontal(), mode_chip(app)].align_y(Alignment::Center),
-            space().height(8),
+            row![text("dextr").size(24).font(SEMIBOLD), space::horizontal(), mode_chip(app)].align_y(Alignment::Center),
+            space().height(10),
             nav,
             space::vertical(),
             peer_line,
-            connect_button(app),
+            connect_button(app).width(Length::Fill),
         ]
         .spacing(10),
     )
     .padding(16)
-    .width(230)
+    .width(236)
     .height(Length::Fill)
     .style(|theme: &Theme| {
         let p = theme.extended_palette();
@@ -279,19 +418,72 @@ fn arrangement_canvas(app: &App, interactive: bool, height: f32) -> Element<'_, 
     let peer_label: &str = app.peer.as_ref().map(|p| p.name.as_str()).unwrap_or_else(|| {
         app.saved.as_ref().and_then(|c| c.last_peer_name.as_deref()).unwrap_or("Other device")
     });
-    let local_label = app.saved.as_ref().map(|c| c.device_name.as_str()).unwrap_or("This device");
     let on_change: fn(Link) -> Message = |l| Message::Set(Setting::Arrange(l));
     canvas(Arrangement {
         local: &app.local_screens,
         peer: app.peer_screens(),
         link: app.config().link(),
-        local_label,
+        local_label: this_name(app),
         peer_label,
         on_change: interactive.then_some(on_change),
     })
     .width(Length::Fill)
     .height(height)
     .into()
+}
+
+// ── Per-device rules ─────────────────────────────────────────────────────
+
+/// Each paired device, with a switch per direction for `channel`.
+fn device_rules<'a>(app: &'a App, channel: Channel, out_text: &'a str, in_text: &'a str) -> Element<'a, Message> {
+    let devices = &app.config().devices;
+    if devices.is_empty() {
+        return card(ic::LAPTOP, "Devices", muted("Pair and connect a device to choose what goes to it and what comes from it."));
+    }
+    let me = this_name(app);
+    let rows = devices.iter().map(|(fp, rules)| {
+        let name = if rules.name.is_empty() { "Paired device" } else { rules.name.as_str() };
+        let connected = app.peer.as_ref().is_some_and(|p| p.name == rules.name);
+        let rule = |outgoing: bool, on: bool| {
+            let device = fp.clone();
+            toggler(on).on_toggle(move |v| Message::Set(Setting::Rule { device: device.clone(), outgoing, channel, on: v }))
+        };
+        let direction = |from: String, to: String, what: &'a str, outgoing: bool, on: bool| -> Element<'a, Message> {
+            row![
+                row![
+                    text(from).size(13).font(MEDIUM),
+                    icon(ic::TO).size(14),
+                    text(to).size(13).font(MEDIUM),
+                    help(what),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center)
+                .width(Length::Fill),
+                rule(outgoing, on),
+            ]
+            .align_y(Alignment::Center)
+            .into()
+        };
+        column![
+            row![
+                icon(ic::LAPTOP),
+                text(name).size(14).font(SEMIBOLD),
+                if connected { chip("Connected", Tone::Good) } else { chip("Offline", Tone::Neutral) },
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+            direction(me.to_string(), name.to_string(), out_text, true, rules.send.get(channel)),
+            direction(name.to_string(), me.to_string(), in_text, false, rules.receive.get(channel)),
+        ]
+        .spacing(12)
+        .into()
+    });
+    card_help(
+        ic::LAPTOP,
+        "Devices",
+        "Choose per device, and per direction, what is shared. Both this switch and the page's main switch must be on.",
+        column(rows).spacing(20),
+    )
 }
 
 // ── Overview ─────────────────────────────────────────────────────────────
@@ -314,14 +506,15 @@ fn overview(app: &App) -> Element<'_, Message> {
     };
 
     let connection = card(
+        ic::PLUG,
         "Connection",
         column![
-            row![column![text(status).size(20), muted(detail)].spacing(4).width(Length::Fill), connect_button(app).width(160)]
+            row![column![text(status).size(20).font(MEDIUM), muted(detail)].spacing(4).width(Length::Fill), connect_button(app).width(170)]
                 .spacing(16)
                 .align_y(Alignment::Center),
             setting(
                 "Share this mouse and keyboard",
-                "Turn off to keep the pointer on this device for a while.",
+                "Turn off to keep the pointer on this device for a while. Also in the tray menu.",
                 toggler(!app.paused).on_toggle(|on| Message::Paused(!on)),
             ),
         ]
@@ -329,21 +522,27 @@ fn overview(app: &App) -> Element<'_, Message> {
     );
 
     let arrangement = card(
+        ic::DISPLAYS,
         "Arrangement",
         column![
             arrangement_canvas(app, false, 170.0),
             row![
                 muted(format!("{} is on the {side} of this device.", app.peer_name())).width(Length::Fill),
-                button("Arrange displays").style(button::secondary).on_press(Message::Navigate(Page::Displays)),
+                icon_button(ic::SLIDERS, "Arrange displays", Message::Navigate(Page::Displays)),
             ]
             .align_y(Alignment::Center),
         ]
         .spacing(10),
     );
 
-    column![heading("Overview", "Share one mouse and keyboard between your computers."), connection, arrangement, permissions_card(app)]
-        .spacing(16)
-        .into()
+    column![
+        heading(ic::OVERVIEW, "Overview", "One mouse, keyboard and clipboard across your computers.", None),
+        connection,
+        arrangement,
+        permissions_card(app),
+    ]
+    .spacing(18)
+    .into()
 }
 
 fn permissions_card(app: &App) -> Element<'_, Message> {
@@ -353,7 +552,7 @@ fn permissions_card(app: &App) -> Element<'_, Message> {
             Access::Granted => (chip("Allowed", Tone::Good), None),
             Access::Denied(reason) => (chip("Unavailable", Tone::Bad), Some(reason.as_str())),
         };
-        let mut info = column![text(what).size(14), muted(why).size(12)].spacing(2).width(Length::Fill);
+        let mut info = column![row![text(what).size(14), help(why)].spacing(6).align_y(Alignment::Center)].spacing(4).width(Length::Fill);
         if let Some(d) = detail {
             info = info.push(muted(d).size(12));
         }
@@ -366,9 +565,9 @@ fn permissions_card(app: &App) -> Element<'_, Message> {
     ]
     .spacing(14);
     if any_denied {
-        body = body.push(row![space::horizontal(), button("Ask again").style(button::secondary).on_press(Message::RetryPermissions)]);
+        body = body.push(row![space::horizontal(), icon_button(ic::REFRESH, "Ask again", Message::RetryPermissions)]);
     }
-    card("Permissions", body)
+    card(ic::SHIELD, "Permissions", body)
 }
 
 // ── Displays ─────────────────────────────────────────────────────────────
@@ -389,22 +588,32 @@ fn screen_list<'a>(screens: &[Rect], empty: &'a str) -> Element<'a, Message> {
     .into()
 }
 
+/// Two-button switch between the layout modes.
+fn layout_switch(current: DisplayLayout) -> Element<'static, Message> {
+    let option = |layout: DisplayLayout| {
+        button(text(layout.to_string()).size(13).font(MEDIUM))
+            .padding([6, 16])
+            .style(if layout == current { button::primary } else { button::secondary })
+            .on_press(Message::Set(Setting::Layout(layout)))
+    };
+    row![option(DisplayLayout::Exact), option(DisplayLayout::Proportional)].spacing(4).into()
+}
+
 fn displays(app: &App) -> Element<'_, Message> {
     let c = app.config();
+    let proportional = c.layout == DisplayLayout::Proportional;
     let details = row![
-        column![
-            text(app.saved.as_ref().map(|c| c.device_name.as_str()).unwrap_or("This device")).size(14),
-            screen_list(&app.local_screens, "Screens appear once input permissions are allowed."),
-        ]
-        .spacing(8)
-        .width(Length::Fill),
-        column![text(app.peer_name()).size(14), screen_list(app.peer_screens().unwrap_or_default(), "Not connected.")]
+        column![text(this_name(app)).size(14).font(MEDIUM), screen_list(&app.local_screens, "Screens appear once input permissions are allowed.")]
+            .spacing(8)
+            .width(Length::Fill),
+        column![text(app.peer_name()).size(14).font(MEDIUM), screen_list(app.peer_screens().unwrap_or_default(), "Not connected.")]
             .spacing(8)
             .width(Length::Fill),
     ]
     .spacing(24);
 
     let switching = card(
+        ic::ZAP,
         "Switching",
         settings_list(vec![
             slide(
@@ -428,28 +637,42 @@ fn displays(app: &App) -> Element<'_, Message> {
         ]),
     );
 
+    let layout_help = if proportional {
+        "Proportional: the screens sit in one row, all the same height. Leaving 30% of the way down your edge enters 30% of the way down theirs, whatever the sizes, so there are no dead zones. Drag the other device's screens left or right."
+    } else {
+        "Exact: real sizes, like the system display settings. Drag the screens to any side and slide them along it. The pointer crosses only where the edges touch (the green line), at the same spot on both screens; they snap to centered or aligned edges when close."
+    };
+    let arrangement = card_help(
+        ic::DISPLAYS,
+        "Arrangement",
+        "The arrangement is shared: the other device shows the same layout from its side, and a change on either one updates both.",
+        column![
+            setting("Layout", layout_help, layout_switch(c.layout)),
+            arrangement_canvas(app, true, 320.0),
+        ]
+        .spacing(14),
+    );
+
     column![
-        heading("Displays", "Drag the other device's screens to where it sits on your desk."),
-        card(
-            "Arrangement",
-            column![
-                arrangement_canvas(app, true, 340.0),
-                muted("Drag the screens to any side and slide them along it. The pointer crosses only where the edges touch (the green line), at the same spot on both screens. They snap to centered or aligned edges when close."),
-                muted("The arrangement is shared: the other device shows the same layout from its side, and a change on either one updates both.").size(12),
-            ]
-            .spacing(14),
-        ),
+        heading(ic::DISPLAYS, "Displays", "Where the other device sits, and how the pointer crosses.", None),
+        arrangement,
         switching,
-        card("Screens", details),
+        card(ic::INFO, "Screens", details),
     ]
-    .spacing(16)
+    .spacing(18)
     .into()
 }
 
 // ── Pairing ──────────────────────────────────────────────────────────────
 
 fn pairing(app: &App) -> Element<'_, Message> {
-    let mut page = column![heading("Pairing", "Pair once. After that, your devices find and connect to each other by themselves.")].spacing(16);
+    let mut page = column![heading(
+        ic::PAIRING,
+        "Pairing",
+        "Pair once. After that, your devices find and connect to each other by themselves.",
+        None
+    )]
+    .spacing(18);
     if let Some(state) = &app.pairing {
         page = page.push(pairing_prompt(app, state));
     }
@@ -485,7 +708,7 @@ fn pairing_prompt<'a>(app: &'a App, state: &'a PairingState) -> Element<'a, Mess
             };
             let mut buttons = row![space::horizontal(), cancel].spacing(8);
             if !we_accepted {
-                buttons = buttons.push(button("Codes match").style(button::primary).on_press(Message::PairDecision(true)));
+                buttons = buttons.push(button(with_icon(ic::CHECK, "Codes match")).style(button::primary).on_press(Message::PairDecision(true)));
             }
             let replacing = app
                 .saved
@@ -494,18 +717,14 @@ fn pairing_prompt<'a>(app: &'a App, state: &'a PairingState) -> Element<'a, Mess
                 .and_then(|c| c.last_peer_name.as_deref())
                 .filter(|old| old != name)
                 .map(|old| muted(format!("This replaces the pairing with {old}.")).size(12));
-            column![
-                text(title).size(16),
-                text(code.as_str()).size(44).font(Font::MONOSPACE),
-                text(status).size(13),
-            ]
-            .push(replacing)
-            .push(buttons)
-            .spacing(10)
-            .into()
+            column![text(title).size(16).font(MEDIUM), text(code.as_str()).size(44).font(Font::MONOSPACE), text(status).size(13)]
+                .push(replacing)
+                .push(buttons)
+                .spacing(10)
+                .into()
         }
     };
-    banner(body, Tone::Active).padding(16).into()
+    banner(body, Tone::Active).padding(18).into()
 }
 
 /// An address as typed on the other device: the port only when it isn't
@@ -528,7 +747,7 @@ fn this_device(app: &App) -> Element<'_, Message> {
             row![
                 text(address.clone()).font(Font::MONOSPACE).size(15).width(Length::Fill),
                 muted(a.interface.as_str()).size(12),
-                button("Copy").style(button::secondary).on_press(Message::Copy(address)),
+                icon_button(ic::COPY, "Copy", Message::Copy(address)),
             ]
             .spacing(12)
             .align_y(Alignment::Center)
@@ -537,14 +756,19 @@ fn this_device(app: &App) -> Element<'_, Message> {
         .spacing(8)
         .into()
     };
-    let name = app.saved.as_ref().map(|c| c.device_name.as_str()).unwrap_or("This device");
-    card(
+    card_help(
+        ic::LAPTOP,
         "This device",
+        "Other devices can pair with this one at these addresses.",
         column![
-            row![text(name).size(15), muted(os_name(Os::current())).size(12)].spacing(8).align_y(Alignment::Center),
-            muted("Other devices can pair with this one at:").size(13),
+            row![text(this_name(app)).size(15).font(MEDIUM), muted(os_name(Os::current())).size(12)].spacing(8).align_y(Alignment::Center),
             addresses,
-            muted(format!("Fingerprint {}", if app.fingerprint.is_empty() { "…" } else { &app.fingerprint })).size(11).font(Font::MONOSPACE),
+            row![
+                icon(ic::FINGERPRINT).size(13),
+                muted(if app.fingerprint.is_empty() { "…" } else { &app.fingerprint }).size(11).font(Font::MONOSPACE),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
         ]
         .spacing(10),
     )
@@ -552,23 +776,26 @@ fn this_device(app: &App) -> Element<'_, Message> {
 
 fn paired_device(app: &App) -> Element<'_, Message> {
     let Some(saved) = app.saved.as_ref().filter(|c| !c.peer_fingerprint.is_empty()) else {
-        return card("Paired device", muted("None yet. Pair with a device below."));
+        return card(ic::PAIRING, "Paired device", muted("None yet. Pair with a device below."));
     };
     let name = app.peer.as_ref().map(|p| p.name.as_str()).or(saved.last_peer_name.as_deref()).unwrap_or("Paired device");
     let status = if app.peer.is_some() { chip("Connected", Tone::Good) } else { chip("Not connected", Tone::Neutral) };
     card(
+        ic::PAIRING,
         "Paired device",
         column![
             row![
-                column![text(name).size(15), muted(saved.peer_address.as_str()).size(12).font(Font::MONOSPACE)].spacing(2).width(Length::Fill),
+                column![text(name).size(15).font(MEDIUM), muted(saved.peer_address.as_str()).size(12).font(Font::MONOSPACE)]
+                    .spacing(2)
+                    .width(Length::Fill),
                 status,
-                connect_button(app).width(140),
+                connect_button(app).width(160),
             ]
             .spacing(12)
             .align_y(Alignment::Center),
             danger_row(app, "Forget this device", "It will need to be paired again.", "Forget", Danger::ForgetPeer),
         ]
-        .spacing(12),
+        .spacing(14),
     )
 }
 
@@ -581,14 +808,15 @@ fn nearby_devices(app: &App) -> Element<'_, Message> {
             let action: Element<'_, Message> = if n.paired {
                 chip("Paired", Tone::Good)
             } else {
-                button("Pair")
+                button(with_icon(ic::PAIRING, "Pair"))
                     .style(button::primary)
                     .on_press_maybe(can_pair.then(|| Message::PairWith(n.address.to_string())))
                     .into()
             };
             row![
+                icon(ic::LAPTOP),
                 column![
-                    text(n.name.as_str()).size(15),
+                    text(n.name.as_str()).size(15).font(MEDIUM),
                     muted(format!("{} · {}", os_name(n.os), reachable(n.address.ip(), n.address.port()))).size(12),
                 ]
                 .spacing(2)
@@ -606,45 +834,43 @@ fn nearby_devices(app: &App) -> Element<'_, Message> {
     if app.peer.is_some() && app.nearby.iter().any(|n| !n.paired) {
         body = body.push(muted("Disconnect first to pair with another device.").size(12));
     }
-    card("Nearby devices", body)
+    card_help(ic::RADAR, "Nearby devices", "Devices running dextr on this network appear here by themselves.", body)
 }
 
 fn pair_by_address(app: &App) -> Element<'_, Message> {
     let can_pair = app.pairing.is_none() && app.peer.is_none() && !app.pair_address.trim().is_empty();
     let go = can_pair.then(|| Message::PairWith(app.pair_address.clone()));
-    card(
+    card_help(
+        ic::NETWORK,
         "Pair by address",
-        column![
-            muted("For a device that isn't listed, for example over Tailscale or another subnet. Type an address shown on its Pairing page.").size(13),
-            row![
-                text_input("192.168.1.20, name.local or 100.64.0.2", &app.pair_address)
-                    .on_input(Message::PairAddress)
-                    .on_submit_maybe(go.clone())
-                    .font(Font::MONOSPACE)
-                    .padding(8),
-                button("Pair").style(button::primary).on_press_maybe(go),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center),
+        "For a device that isn't listed, for example over Tailscale or another subnet. Type an address shown on its Pairing page.",
+        row![
+            text_input("192.168.1.20, name.local or 100.64.0.2", &app.pair_address)
+                .on_input(Message::PairAddress)
+                .on_submit_maybe(go.clone())
+                .font(Font::MONOSPACE)
+                .padding(9),
+            button(with_icon(ic::PAIRING, "Pair")).style(button::primary).on_press_maybe(go),
         ]
-        .spacing(10),
+        .spacing(8)
+        .align_y(Alignment::Center),
     )
 }
 
 fn pairing_help<'a>() -> Element<'a, Message> {
     const FIREWALLD: &str = "sudo firewall-cmd --permanent --add-port=47800-47801/udp && sudo firewall-cmd --reload";
-    card(
+    card_help(
+        ic::INFO,
         "Not finding each other?",
+        "Open dextr on both devices on the same network. dextr uses UDP ports 47800 (connection) and 47801 (finding devices). On macOS, allow dextr if it asks to accept incoming connections.",
         column![
-            muted("Open dextr on both devices and connect them to the same network. Devices on other networks (Tailscale, VPN) can pair by address."),
-            muted("dextr uses UDP ports 47800 (connection) and 47801 (finding devices). On Linux with a firewall, such as Fedora, allow them:"),
+            muted("On Linux with a firewall, such as Fedora, allow dextr's ports:"),
             row![
-                container(text(FIREWALLD).font(Font::MONOSPACE).size(12)).padding(8).width(Length::Fill).style(container::bordered_box),
-                button("Copy").style(button::secondary).on_press(Message::Copy(FIREWALLD.into())),
+                container(text(FIREWALLD).font(Font::MONOSPACE).size(12)).padding(9).width(Length::Fill).style(container::bordered_box),
+                icon_button(ic::COPY, "Copy", Message::Copy(FIREWALLD.into())),
             ]
             .spacing(8)
             .align_y(Alignment::Center),
-            muted("On macOS, allow dextr if it asks to accept incoming network connections."),
         ]
         .spacing(10),
     )
@@ -652,9 +878,24 @@ fn pairing_help<'a>() -> Element<'a, Message> {
 
 // ── Mouse ────────────────────────────────────────────────────────────────
 
+fn off_banner<'a>(what: &'a str) -> Element<'a, Message> {
+    banner(muted(what), Tone::Warn).into()
+}
+
 fn mouse(app: &App) -> Element<'_, Message> {
     let m = &app.config().mouse;
+    let mut page = column![heading(
+        ic::MOUSE,
+        "Mouse",
+        "How this mouse behaves on other devices.",
+        Some(master("Share mouse", m.enabled, Setting::MouseEnabled)),
+    )]
+    .spacing(18);
+    if !m.enabled {
+        page = page.push(off_banner("The mouse is off: the pointer stays on this device (and so does the keyboard)."));
+    }
     let pointer = card(
+        ic::POINTER,
         "Pointer",
         settings_list(vec![
             slide(
@@ -669,8 +910,8 @@ fn mouse(app: &App) -> Element<'_, Message> {
             switch("Swap left and right buttons", "For left-handed use on the other device.", m.swap_buttons, Setting::SwapButtons),
         ]),
     );
-
     let scrolling = card(
+        ic::SCROLL,
         "Scrolling",
         settings_list(vec![
             slide(
@@ -690,17 +931,15 @@ fn mouse(app: &App) -> Element<'_, Message> {
             ),
         ]),
     );
-
-    let sharing = card(
-        "Sharing",
-        settings_list(vec![setting(
-            "Share this mouse",
-            "When off, the pointer stays on this device.",
-            toggler(!app.paused).on_toggle(|on| Message::Paused(!on)),
-        )]),
-    );
-
-    column![heading("Mouse", "How this mouse behaves on the other device."), pointer, scrolling, sharing].spacing(16).into()
+    page.push(device_rules(
+        app,
+        Channel::Mouse,
+        "This mouse can move onto that device's screens.",
+        "That device's mouse can move onto this device and control it.",
+    ))
+    .push(pointer)
+    .push(scrolling)
+    .into()
 }
 
 // ── Keyboard ─────────────────────────────────────────────────────────────
@@ -715,7 +954,19 @@ fn keyboard(app: &App) -> Element<'_, Message> {
         None => "Automatic swaps Ctrl and Cmd when exactly one of the two devices is a Mac, so copy and paste stay under the same finger.".into(),
     };
 
+    let mut page = column![heading(
+        ic::KEYBOARD,
+        "Keyboard",
+        "How this keyboard behaves on other devices.",
+        Some(master("Share keyboard", k.enabled, Setting::KeyboardEnabled)),
+    )]
+    .spacing(18);
+    if !k.enabled {
+        page = page.push(off_banner("The keyboard is off: keys aren't sent while the pointer is on another device. The shortcut back still works."));
+    }
+
     let modifiers = card(
+        ic::COMMAND,
         "Modifier keys",
         column![
             choose("Mapping", "How Ctrl, Alt and Cmd/Super are sent.", ModifierMap::ALL, k.modifiers, Setting::Modifiers),
@@ -733,6 +984,7 @@ fn keyboard(app: &App) -> Element<'_, Message> {
         ReturnShortcut::Pause => keycap("Pause"),
     };
     let shortcuts = card(
+        ic::ROTATE,
         "Shortcuts",
         column![
             choose(
@@ -747,33 +999,42 @@ fn keyboard(app: &App) -> Element<'_, Message> {
         .spacing(10),
     );
 
-    let layout = card(
+    page.push(device_rules(
+        app,
+        Channel::Keyboard,
+        "Keys typed here go to that device while the pointer is on it.",
+        "Keys typed on that device go to this one while its pointer is here.",
+    ))
+    .push(modifiers)
+    .push(shortcuts)
+    .push(card_help(
+        ic::KEYBOARD,
         "Layout",
-        column![
-            muted("Keys are sent by their position, like a USB keyboard. The other device types with its own keyboard layout."),
-            muted("Every key and button you're holding is released whenever the pointer switches, so nothing gets stuck."),
-        ]
-        .spacing(6),
-    );
-
-    column![heading("Keyboard", "How this keyboard behaves on the other device."), modifiers, shortcuts, layout]
-        .spacing(16)
-        .into()
+        "Keys are sent by their position, like a USB keyboard; the other device types with its own layout. Every key and button you're holding is released whenever the pointer switches, so nothing gets stuck.",
+        muted("Keys follow the other device's keyboard layout."),
+    ))
+    .into()
 }
 
-// ── Windows ──────────────────────────────────────────────────────────────
+// ── Clipboard ────────────────────────────────────────────────────────────
 
 fn clipboard(app: &App) -> Element<'_, Message> {
     let c = &app.config().clipboard;
-    let settings = card(
+    let mut page = column![heading(
+        ic::CLIPBOARD,
         "Clipboard",
+        "Copy on one device, paste on another.",
+        Some(master("Share clipboard", c.enabled, Setting::ClipboardEnabled)),
+    )]
+    .spacing(18);
+    if !c.enabled {
+        page = page.push(off_banner("The clipboard is off: copies stay on the device they were made on."));
+    }
+    let options = card_help(
+        ic::SLIDERS,
+        "Options",
+        "Whatever you copy is sent right away over the encrypted connection, so it's ready to paste wherever the pointer is. Text and images are supported; files aren't yet.",
         settings_list(vec![
-            switch(
-                "Share the clipboard",
-                "Copy on one device, paste on the other. Applies in both directions.",
-                c.enabled,
-                Setting::ClipboardEnabled,
-            ),
             switch("Include images", "Screenshots and copied pictures go across too.", c.images, Setting::ClipboardImages),
             slide(
                 "Largest copy",
@@ -786,15 +1047,14 @@ fn clipboard(app: &App) -> Element<'_, Message> {
             ),
         ]),
     );
-    let notes = card(
-        "Good to know",
-        column![
-            muted("Whatever you copy is sent to the other device right away over the encrypted connection, so it's ready to paste wherever the pointer is.").size(12),
-            muted("Text and images are supported. Files aren't yet.").size(12),
-        ]
-        .spacing(6),
-    );
-    column![heading("Clipboard", "Copy on one device, paste on the other."), settings, notes].spacing(16).into()
+    page.push(device_rules(
+        app,
+        Channel::Clipboard,
+        "What you copy here can be pasted on that device.",
+        "What you copy on that device can be pasted here.",
+    ))
+    .push(options)
+    .into()
 }
 
 // ── Activity ─────────────────────────────────────────────────────────────
@@ -805,16 +1065,12 @@ fn activity(app: &App) -> Element<'_, Message> {
     } else {
         column(app.log.iter().map(|l| text(l).size(13).into())).spacing(8).into()
     };
+    let clear = button(with_icon(ic::TRASH, "Clear")).style(button::secondary).on_press_maybe((!app.log.is_empty()).then_some(Message::ClearLog));
     column![
-        row![
-            heading("Activity", "Connections, permissions and errors, newest first."),
-            space::horizontal(),
-            button("Clear").style(button::secondary).on_press_maybe((!app.log.is_empty()).then_some(Message::ClearLog)),
-        ]
-        .align_y(Alignment::Center),
-        card("Log", list),
+        heading(ic::ACTIVITY, "Activity", "Connections, permissions and errors, newest first.", Some(clear.into())),
+        card(ic::ACTIVITY, "Log", list),
     ]
-    .spacing(16)
+    .spacing(18)
     .into()
 }
 
@@ -825,22 +1081,28 @@ fn settings(app: &App) -> Element<'_, Message> {
     let port_changed = app.saved.as_ref().is_some_and(|c| c.port.to_string() != app.form.port.trim());
 
     let device = card(
+        ic::LAPTOP,
         "Device",
         column![
-            field("Name", text_input("Shown on the other device", &app.form.name).on_input(Message::Name).on_submit(Message::Save).padding(8)),
-            field("Port (UDP)", text_input("47800", &app.form.port).on_input(Message::Port).on_submit(Message::Save).padding(8).width(140)),
+            field("Name", text_input("Shown on the other device", &app.form.name).on_input(Message::Name).on_submit(Message::Save).padding(9)),
+            field("Port (UDP)", text_input("47800", &app.form.port).on_input(Message::Port).on_submit(Message::Save).padding(9).width(140)),
             muted(match (app.listening, port_changed) {
                 (_, true) => "The new port takes effect after restarting dextr.".to_string(),
                 (Some(port), false) => format!("Listening on UDP port {port}."),
                 (None, false) => "Not listening. Another app may be using this port.".to_string(),
             }),
-            row![space::horizontal(), button("Save").style(button::primary).on_press_maybe(app.unsaved().then_some(Message::Save))],
+            row![space::horizontal(), button(with_icon(ic::CHECK, "Save")).style(button::primary).on_press_maybe(app.unsaved().then_some(Message::Save))],
         ]
         .spacing(14),
     );
 
-    let startup_desc = if autostart::supported() { "Start dextr automatically when you log in." } else { "Not available on this OS yet." };
+    let startup_desc = if autostart::supported() {
+        "Start dextr in the tray when you log in."
+    } else {
+        "Not available on this OS yet."
+    };
     let startup = card(
+        ic::ROCKET,
         "Startup and connection",
         settings_list(vec![
             setting(
@@ -858,12 +1120,14 @@ fn settings(app: &App) -> Element<'_, Message> {
         ]),
     );
 
-    let privacy = card(
+    let privacy = card_help(
+        ic::SHIELD,
         "Privacy and security",
+        "Connections are encrypted with QUIC (TLS 1.3). Only the device whose fingerprint you paired can connect.",
         settings_list(vec![
             switch(
                 "Allow being controlled",
-                "Let the paired device's mouse and keyboard work on this device.",
+                "Let paired devices' mouse and keyboard work on this device at all. Per-device choices are on the Mouse and Keyboard pages.",
                 c.connection.allow_control,
                 Setting::AllowControl,
             ),
@@ -873,31 +1137,30 @@ fn settings(app: &App) -> Element<'_, Message> {
                 c.connection.allow_incoming,
                 Setting::AllowIncoming,
             ),
-            muted("Connections are encrypted with QUIC (TLS 1.3). Only the device whose fingerprint you paired can connect.").size(12).into(),
         ]),
     );
 
     let appearance = card(
+        ic::PALETTE,
         "Appearance",
         settings_list(vec![choose("Theme", "Colors used by this window.", Appearance::ALL, c.appearance, Setting::Appearance)]),
     );
 
     let config_dir = dextr_core::config::dir().map(|d| d.display().to_string()).unwrap_or_else(|e| e.to_string());
-    let files = card(
+    let files = card_help(
+        ic::FOLDER,
         "Files",
-        column![
-            muted("Settings and this device's certificate are stored here. Keep key.der private."),
-            row![
-                text(config_dir).font(Font::MONOSPACE).size(13).width(Length::Fill),
-                button("Open folder").style(button::secondary).on_press(Message::OpenConfigFolder),
-            ]
-            .spacing(12)
-            .align_y(Alignment::Center),
+        "Settings and this device's certificate are stored here. Keep key.der private.",
+        row![
+            text(config_dir).font(Font::MONOSPACE).size(13).width(Length::Fill),
+            icon_button(ic::FOLDER, "Open folder", Message::OpenConfigFolder),
         ]
-        .spacing(10),
+        .spacing(12)
+        .align_y(Alignment::Center),
     );
 
     let reset = card(
+        ic::ROTATE,
         "Reset",
         settings_list(vec![
             danger_row(app, "Forget paired device", "Disconnect and remove its address and fingerprint.", "Forget", Danger::ForgetPeer),
@@ -917,12 +1180,25 @@ fn settings(app: &App) -> Element<'_, Message> {
     );
 
     let about = card(
+        ic::INFO,
         "About",
-        column![text(format!("dextr {}", env!("CARGO_PKG_VERSION"))).size(14), muted("One mouse, keyboard and clipboard across your computers.")]
-            .spacing(6),
+        column![
+            text(format!("dextr {}", env!("CARGO_PKG_VERSION"))).size(14).font(MEDIUM),
+            muted("One mouse, keyboard and clipboard across your computers. Closing the window keeps dextr in the tray."),
+        ]
+        .spacing(6),
     );
 
-    column![heading("Settings", "General options for this device."), device, startup, privacy, appearance, files, reset, about]
-        .spacing(16)
-        .into()
+    column![
+        heading(ic::SETTINGS, "Settings", "General options for this device.", None),
+        device,
+        startup,
+        privacy,
+        appearance,
+        files,
+        reset,
+        about,
+    ]
+    .spacing(18)
+    .into()
 }

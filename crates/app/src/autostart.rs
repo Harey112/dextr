@@ -23,7 +23,7 @@ fn entry() -> Option<PathBuf> {
 #[cfg(target_os = "linux")]
 fn contents(exe: &std::path::Path) -> String {
     format!(
-        "[Desktop Entry]\nType=Application\nName=dextr\nComment=Share one mouse and keyboard between computers\nExec=\"{}\"\nIcon=dev.dextr.dextr\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
+        "[Desktop Entry]\nType=Application\nName=dextr\nComment=Share one mouse and keyboard between computers\nExec=\"{}\" --hidden\nIcon=dev.dextr.dextr\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
         exe.display()
     )
 }
@@ -41,6 +41,7 @@ fn contents(exe: &std::path::Path) -> String {
     <key>ProgramArguments</key>
     <array>
         <string>{exe}</string>
+        <string>--hidden</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
