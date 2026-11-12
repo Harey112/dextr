@@ -19,9 +19,14 @@ mod linux;
 #[cfg(target_os = "linux")]
 use linux as native;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+use macos as native;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod unsupported;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use unsupported as native;
 
 /// Input read from the local devices while captured. Motion is relative and

@@ -24,6 +24,9 @@ pub const ALPN: &[u8] = b"dextr/1";
 /// Default UDP port.
 pub const DEFAULT_PORT: u16 = 47800;
 
+/// UDP port for finding other dextr devices on the local network.
+pub const DISCOVERY_PORT: u16 = 47801;
+
 /// Largest frame accepted on a reliable stream.
 pub const MAX_FRAME: usize = 64 * 1024;
 
@@ -101,6 +104,43 @@ pub enum Message {
     ReleaseAll,
     /// The sender's screen layout changed.
     Displays(Vec<Rect>),
+    /// Asks to pair (from the device that dialed), or answers with the
+    /// responder's own details. Sent instead of [`Message::Hello`] by a device
+    /// that isn't paired yet.
+    PairRequest { name: String, os: Os },
+    /// The sender's user confirmed that both devices show the same code.
+    PairAccept,
+    /// The sender's user declined or cancelled.
+    PairReject,
+}
+
+/// Broadcast on [`DISCOVERY_PORT`] every few seconds so devices on the same
+/// network can list each other. Carries nothing secret: pairing still needs
+/// both users to confirm a code.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Beacon {
+    pub magic: [u8; 5],
+    pub protocol: u16,
+    pub name: String,
+    pub os: Os,
+    /// The QUIC port the sender listens on.
+    pub port: u16,
+    /// SHA-256 of the sender's certificate.
+    pub fingerprint: [u8; 32],
+}
+
+impl Beacon {
+    pub const MAGIC: [u8; 5] = *b"dextr";
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, CodecError> {
+        Ok(postcard::to_stdvec(self)?)
+    }
+
+    /// Decodes a beacon, ignoring anything that isn't one.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let b: Beacon = postcard::from_bytes(bytes).ok()?;
+        (b.magic == Self::MAGIC).then_some(b)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

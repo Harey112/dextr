@@ -10,7 +10,7 @@ mod pages;
 use std::collections::VecDeque;
 
 use dextr_core::{
-    Command, Config, Event, Mode,
+    Command, Config, Event, LocalAddress, Mode, Nearby, PairingState,
     settings::{Appearance, Codec, FrameRate, ModifierMap, ReturnShortcut, StreamQuality},
 };
 use dextr_proto::{Os, Rect};
@@ -122,6 +122,12 @@ pub struct App {
     pub launch_at_login: bool,
     pub confirm: Option<Danger>,
     pub restart_needed: bool,
+    pub pairing: Option<PairingState>,
+    pub pairing_error: Option<String>,
+    pub nearby: Vec<Nearby>,
+    pub addresses: Vec<LocalAddress>,
+    /// The "pair by address" field.
+    pub pair_address: String,
 }
 
 /// The editable copy of the settings.
@@ -246,8 +252,10 @@ pub enum Message {
     Navigate(Page),
     Name(String),
     Port(String),
-    Address(String),
-    PeerFingerprint(String),
+    PairAddress(String),
+    PairWith(String),
+    PairDecision(bool),
+    Copy(String),
     Set(Setting),
     Save,
     Connect,
@@ -255,8 +263,6 @@ pub enum Message {
     Paused(bool),
     RetryPermissions,
     CopyFingerprint,
-    PasteFingerprint,
-    Pasted(Option<String>),
     ClearLog,
     OpenConfigFolder,
     DismissNotice,
@@ -377,8 +383,18 @@ impl App {
             Message::Navigate(page) => self.page = page,
             Message::Name(v) => self.form.name = v,
             Message::Port(v) => self.form.port = v,
-            Message::Address(v) => self.form.address = v,
-            Message::PeerFingerprint(v) => self.form.fingerprint = v,
+            Message::PairAddress(v) => self.pair_address = v,
+            Message::PairWith(address) => {
+                if !address.trim().is_empty() {
+                    self.pairing_error = None;
+                    self.send(Command::Pair(address));
+                }
+            }
+            Message::PairDecision(ok) => self.send(Command::PairDecision(ok)),
+            Message::Copy(text) => {
+                self.push_log(format!("Copied {text}."));
+                return iced::clipboard::write(text);
+            }
             Message::Set(setting) => {
                 let save_now = setting.saves_immediately();
                 setting.apply(&mut self.form.config);
@@ -418,9 +434,6 @@ impl App {
                 self.push_log("Fingerprint copied.");
                 return iced::clipboard::write(self.fingerprint.clone());
             }
-            Message::PasteFingerprint => return iced::clipboard::read().map(Message::Pasted),
-            Message::Pasted(Some(text)) => self.form.fingerprint = text.trim().to_owned(),
-            Message::Pasted(None) => self.notify("The clipboard is empty."),
             Message::ClearLog => self.log.clear(),
             Message::OpenConfigFolder => {
                 if let Ok(dir) = dextr_core::config::dir() {
@@ -471,7 +484,7 @@ impl App {
         match result {
             Ok(()) => {
                 self.restart_needed = true;
-                self.notify("A new fingerprint will be created when you restart dextr. Then paste it on the other device again.");
+                self.notify("A new fingerprint will be created when you restart dextr. Then pair the devices again.");
             }
             Err(e) => self.notify(format!("Cannot reset the fingerprint: {e:#}")),
         }
@@ -538,6 +551,21 @@ impl App {
                 }
             }
             Event::Mode(m) => self.mode = Some(m),
+            Event::Pairing(state) => {
+                // A request from the other device: bring the code into view.
+                if let Some(PairingState::Confirm { incoming: true, .. }) = &state
+                    && !matches!(self.pairing, Some(PairingState::Confirm { .. }))
+                {
+                    self.page = Page::Pairing;
+                }
+                if state.is_some() {
+                    self.pairing_error = None;
+                }
+                self.pairing = state;
+            }
+            Event::PairingFailed(reason) => self.pairing_error = Some(reason),
+            Event::Nearby(list) => self.nearby = list,
+            Event::Addresses(list) => self.addresses = list,
             Event::Log(line) => {
                 if line.starts_with("Connection failed") {
                     self.connecting = false;

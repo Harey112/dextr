@@ -1,9 +1,10 @@
 use dextr_core::{
+    PairingState,
     edge::Link,
     Mode,
     settings::{Appearance, Codec, FrameRate, ModifierMap, ReturnShortcut, StreamQuality},
 };
-use dextr_proto::{Os, Rect, Side};
+use dextr_proto::{DEFAULT_PORT, Os, Rect, Side};
 use iced::{
     Alignment, Background, Border, Element, Font, Length, Theme,
     widget::{
@@ -451,63 +452,205 @@ fn displays(app: &App) -> Element<'_, Message> {
 // ── Pairing ──────────────────────────────────────────────────────────────
 
 fn pairing(app: &App) -> Element<'_, Message> {
-    let this_device = card(
+    let mut page = column![heading("Pairing", "Pair once. After that, your devices find and connect to each other by themselves.")].spacing(16);
+    if let Some(state) = &app.pairing {
+        page = page.push(pairing_prompt(app, state));
+    }
+    if let Some(error) = &app.pairing_error {
+        page = page.push(banner(text(error.as_str()).size(13), Tone::Bad));
+    }
+    page.push(this_device(app))
+        .push(paired_device(app))
+        .push(nearby_devices(app))
+        .push(pair_by_address(app))
+        .push(pairing_help())
+        .into()
+}
+
+/// The code to compare, or progress while the other device is reached.
+fn pairing_prompt<'a>(app: &'a App, state: &'a PairingState) -> Element<'a, Message> {
+    let cancel = button("Cancel").style(button::secondary).on_press(Message::PairDecision(false));
+    let body: Element<'a, Message> = match state {
+        PairingState::Contacting { address } => row![text(format!("Contacting {address}…")).size(14).width(Length::Fill), cancel]
+            .spacing(12)
+            .align_y(Alignment::Center)
+            .into(),
+        PairingState::Confirm { name, os, code, incoming, we_accepted, they_accepted } => {
+            let title = if *incoming {
+                format!("{name} ({}) wants to pair with this device", os_name(*os))
+            } else {
+                format!("Pairing with {name} ({})", os_name(*os))
+            };
+            let status = match (we_accepted, they_accepted) {
+                (true, false) => format!("Waiting for {name} to confirm…"),
+                (false, true) => format!("{name} confirmed. Confirm here too if the codes match."),
+                _ => format!("Check that {name} shows the same code, then confirm on both devices."),
+            };
+            let mut buttons = row![space::horizontal(), cancel].spacing(8);
+            if !we_accepted {
+                buttons = buttons.push(button("Codes match").style(button::primary).on_press(Message::PairDecision(true)));
+            }
+            let replacing = app
+                .saved
+                .as_ref()
+                .filter(|c| !c.peer_fingerprint.is_empty())
+                .and_then(|c| c.last_peer_name.as_deref())
+                .filter(|old| old != name)
+                .map(|old| muted(format!("This replaces the pairing with {old}.")).size(12));
+            column![
+                text(title).size(16),
+                text(code.as_str()).size(44).font(Font::MONOSPACE),
+                text(status).size(13),
+            ]
+            .push(replacing)
+            .push(buttons)
+            .spacing(10)
+            .into()
+        }
+    };
+    banner(body, Tone::Active).padding(16).into()
+}
+
+/// An address as typed on the other device: the port only when it isn't
+/// the default.
+fn reachable(ip: std::net::IpAddr, port: u16) -> String {
+    match (ip, port == DEFAULT_PORT) {
+        (ip, true) => ip.to_string(),
+        (std::net::IpAddr::V6(v6), false) => format!("[{v6}]:{port}"),
+        (ip, false) => format!("{ip}:{port}"),
+    }
+}
+
+fn this_device(app: &App) -> Element<'_, Message> {
+    let port = app.listening.unwrap_or(DEFAULT_PORT);
+    let addresses: Element<'_, Message> = if app.addresses.is_empty() {
+        muted("No network connection.").into()
+    } else {
+        column(app.addresses.iter().map(|a| {
+            let address = reachable(a.ip, port);
+            row![
+                text(address.clone()).font(Font::MONOSPACE).size(15).width(Length::Fill),
+                muted(a.interface.as_str()).size(12),
+                button("Copy").style(button::secondary).on_press(Message::Copy(address)),
+            ]
+            .spacing(12)
+            .align_y(Alignment::Center)
+            .into()
+        }))
+        .spacing(8)
+        .into()
+    };
+    let name = app.saved.as_ref().map(|c| c.device_name.as_str()).unwrap_or("This device");
+    card(
         "This device",
         column![
-            muted("On the other device, paste this into Pairing → Fingerprint."),
-            container(text(if app.fingerprint.is_empty() { "Loading…" } else { &app.fingerprint }).font(Font::MONOSPACE).size(15))
-                .padding(12)
-                .width(Length::Fill)
-                .style(container::bordered_box),
-            row![space::horizontal(), button("Copy fingerprint").style(button::secondary).on_press(Message::CopyFingerprint)],
+            row![text(name).size(15), muted(os_name(Os::current())).size(12)].spacing(8).align_y(Alignment::Center),
+            muted("Other devices can pair with this one at:").size(13),
+            addresses,
+            muted(format!("Fingerprint {}", if app.fingerprint.is_empty() { "…" } else { &app.fingerprint })).size(11).font(Font::MONOSPACE),
         ]
         .spacing(10),
-    );
+    )
+}
 
-    let other = card(
-        "Other device",
+fn paired_device(app: &App) -> Element<'_, Message> {
+    let Some(saved) = app.saved.as_ref().filter(|c| !c.peer_fingerprint.is_empty()) else {
+        return card("Paired device", muted("None yet. Pair with a device below."));
+    };
+    let name = app.peer.as_ref().map(|p| p.name.as_str()).or(saved.last_peer_name.as_deref()).unwrap_or("Paired device");
+    let status = if app.peer.is_some() { chip("Connected", Tone::Good) } else { chip("Not connected", Tone::Neutral) };
+    card(
+        "Paired device",
         column![
-            field(
-                "Address",
-                text_input("192.168.1.20, or name.local, or host:port", &app.form.address)
-                    .on_input(Message::Address)
-                    .on_submit(Message::Connect)
-                    .padding(8),
-            ),
-            field(
-                "Fingerprint",
-                row![
-                    text_input("Paste the other device's fingerprint", &app.form.fingerprint)
-                        .on_input(Message::PeerFingerprint)
-                        .on_submit(Message::Save)
-                        .font(Font::MONOSPACE)
-                        .padding(8),
-                    button("Paste").style(button::secondary).on_press(Message::PasteFingerprint),
-                ]
-                .spacing(8)
-                .align_y(Alignment::Center),
-            ),
             row![
-                space::horizontal(),
-                button("Save").style(button::secondary).on_press_maybe(app.unsaved().then_some(Message::Save)),
-                connect_button(app).width(160),
+                column![text(name).size(15), muted(saved.peer_address.as_str()).size(12).font(Font::MONOSPACE)].spacing(2).width(Length::Fill),
+                status,
+                connect_button(app).width(140),
             ]
-            .spacing(8),
+            .spacing(12)
+            .align_y(Alignment::Center),
+            danger_row(app, "Forget this device", "It will need to be paired again.", "Forget", Danger::ForgetPeer),
         ]
-        .spacing(14),
-    );
+        .spacing(12),
+    )
+}
 
-    let steps = card(
-        "How pairing works",
+fn nearby_devices(app: &App) -> Element<'_, Message> {
+    let can_pair = app.pairing.is_none() && app.peer.is_none();
+    let list: Element<'_, Message> = if app.nearby.is_empty() {
+        muted("Looking for other devices running dextr on this network…").into()
+    } else {
+        column(app.nearby.iter().map(|n| {
+            let action: Element<'_, Message> = if n.paired {
+                chip("Paired", Tone::Good)
+            } else {
+                button("Pair")
+                    .style(button::primary)
+                    .on_press_maybe(can_pair.then(|| Message::PairWith(n.address.to_string())))
+                    .into()
+            };
+            row![
+                column![
+                    text(n.name.as_str()).size(15),
+                    muted(format!("{} · {}", os_name(n.os), reachable(n.address.ip(), n.address.port()))).size(12),
+                ]
+                .spacing(2)
+                .width(Length::Fill),
+                action,
+            ]
+            .spacing(12)
+            .align_y(Alignment::Center)
+            .into()
+        }))
+        .spacing(12)
+        .into()
+    };
+    let mut body = column![list].spacing(10);
+    if app.peer.is_some() && app.nearby.iter().any(|n| !n.paired) {
+        body = body.push(muted("Disconnect first to pair with another device.").size(12));
+    }
+    card("Nearby devices", body)
+}
+
+fn pair_by_address(app: &App) -> Element<'_, Message> {
+    let can_pair = app.pairing.is_none() && app.peer.is_none() && !app.pair_address.trim().is_empty();
+    let go = can_pair.then(|| Message::PairWith(app.pair_address.clone()));
+    card(
+        "Pair by address",
         column![
-            muted("1. Open dextr on both devices."),
-            muted("2. On each device, paste the other device's fingerprint. Only that device can connect."),
-            muted("3. On one of them, enter the other's address and press Connect. UDP port 47800 must be allowed through the firewall."),
+            muted("For a device that isn't listed, for example over Tailscale or another subnet. Type an address shown on its Pairing page.").size(13),
+            row![
+                text_input("192.168.1.20, name.local or 100.64.0.2", &app.pair_address)
+                    .on_input(Message::PairAddress)
+                    .on_submit_maybe(go.clone())
+                    .font(Font::MONOSPACE)
+                    .padding(8),
+                button("Pair").style(button::primary).on_press_maybe(go),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
         ]
-        .spacing(6),
-    );
+        .spacing(10),
+    )
+}
 
-    column![heading("Pairing", "Connect to your other device."), this_device, other, steps].spacing(16).into()
+fn pairing_help<'a>() -> Element<'a, Message> {
+    const FIREWALLD: &str = "sudo firewall-cmd --permanent --add-port=47800-47801/udp && sudo firewall-cmd --reload";
+    card(
+        "Not finding each other?",
+        column![
+            muted("Open dextr on both devices and connect them to the same network. Devices on other networks (Tailscale, VPN) can pair by address."),
+            muted("dextr uses UDP ports 47800 (connection) and 47801 (finding devices). On Linux with a firewall, such as Fedora, allow them:"),
+            row![
+                container(text(FIREWALLD).font(Font::MONOSPACE).size(12)).padding(8).width(Length::Fill).style(container::bordered_box),
+                button("Copy").style(button::secondary).on_press(Message::Copy(FIREWALLD.into())),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+            muted("On macOS, allow dextr if it asks to accept incoming network connections."),
+        ]
+        .spacing(10),
+    )
 }
 
 // ── Mouse ────────────────────────────────────────────────────────────────

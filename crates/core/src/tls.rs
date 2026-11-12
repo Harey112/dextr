@@ -1,12 +1,15 @@
-//! QUIC/TLS configuration with mutual certificate pinning.
+//! QUIC/TLS configuration with self-signed device certificates.
 //!
-//! Both sides present their self-signed certificate. A connection succeeds
-//! only if each side's fingerprint is the one the other side has paired with.
+//! Both sides always present their certificate and prove they hold its key.
+//! Which certificates are trusted is decided by fingerprint:
+//!
+//! * dialing a paired device pins its fingerprint in the handshake;
+//! * dialing to pair accepts any certificate (the users then compare a code
+//!   derived from both fingerprints);
+//! * the listener accepts any client certificate, and the engine checks the
+//!   fingerprint before doing anything but pairing.
 
-use std::{
-    sync::{Arc, RwLock},
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 use dextr_proto::ALPN;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
@@ -19,10 +22,6 @@ use rustls::{
 };
 
 use crate::identity::{self, Fingerprint, Identity};
-
-/// The peer fingerprint we accept, shared with the running server config so
-/// re-pairing takes effect without restarting the listener.
-pub type Trusted = Arc<RwLock<Option<Fingerprint>>>;
 
 fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
@@ -37,14 +36,16 @@ fn transport() -> Arc<quinn::TransportConfig> {
 
 #[derive(Debug)]
 struct Pinned {
-    trusted: Trusted,
+    /// `None` accepts any certificate (signatures are still verified).
+    expected: Option<Fingerprint>,
     provider: Arc<CryptoProvider>,
 }
 
 impl Pinned {
     fn check(&self, cert: &CertificateDer<'_>) -> Result<(), rustls::Error> {
         let fp = identity::fingerprint(cert);
-        match *self.trusted.read().unwrap() {
+        match self.expected {
+            None => Ok(()),
             Some(expected) if expected == fp => Ok(()),
             _ => {
                 tracing::warn!("rejected unpaired peer {}", identity::format(&fp));
@@ -120,8 +121,8 @@ impl ClientCertVerifier for Pinned {
     }
 }
 
-pub fn server_config(id: &Identity, trusted: Trusted) -> anyhow::Result<quinn::ServerConfig> {
-    let verifier = Arc::new(Pinned { trusted, provider: provider() });
+pub fn server_config(id: &Identity) -> anyhow::Result<quinn::ServerConfig> {
+    let verifier = Arc::new(Pinned { expected: None, provider: provider() });
     let mut tls = rustls::ServerConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_client_cert_verifier(verifier)
@@ -132,8 +133,9 @@ pub fn server_config(id: &Identity, trusted: Trusted) -> anyhow::Result<quinn::S
     Ok(config)
 }
 
-pub fn client_config(id: &Identity, peer: Fingerprint) -> anyhow::Result<quinn::ClientConfig> {
-    let verifier = Arc::new(Pinned { trusted: Arc::new(RwLock::new(Some(peer))), provider: provider() });
+/// Dials `peer` only, or anyone when pairing (`None`).
+pub fn client_config(id: &Identity, peer: Option<Fingerprint>) -> anyhow::Result<quinn::ClientConfig> {
+    let verifier = Arc::new(Pinned { expected: peer, provider: provider() });
     let mut tls = rustls::ClientConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .dangerous()
@@ -143,4 +145,33 @@ pub fn client_config(id: &Identity, peer: Fingerprint) -> anyhow::Result<quinn::
     let mut config = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls)?));
     config.transport_config(transport());
     Ok(config)
+}
+
+/// The fingerprint of the certificate the other side presented.
+pub fn peer_fingerprint(conn: &quinn::Connection) -> Option<Fingerprint> {
+    let certs = conn.peer_identity()?.downcast::<Vec<CertificateDer<'static>>>().ok()?;
+    certs.first().map(|c| identity::fingerprint(c))
+}
+
+/// The 6-digit code both users compare when pairing. Derived from both
+/// certificates, so a device in the middle (which can't present either
+/// device's certificate) makes the two screens show different codes.
+pub fn pairing_code(a: &Fingerprint, b: &Fingerprint) -> String {
+    use sha2::{Digest, Sha256};
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    let hash = Sha256::new().chain_update(b"dextr pairing code").chain_update(lo).chain_update(hi).finalize();
+    let n = u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]) % 1_000_000;
+    format!("{:03} {:03}", n / 1000, n % 1000)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn pairing_code_is_the_same_on_both_sides() {
+        let (a, b, c) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        let code = super::pairing_code(&a, &b);
+        assert_eq!(code, super::pairing_code(&b, &a));
+        assert_eq!(code.len(), 7);
+        assert_ne!(code, super::pairing_code(&a, &c));
+    }
 }

@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     sync::{Arc, RwLock},
     time::Duration,
@@ -6,15 +7,27 @@ use std::{
 
 use anyhow::{Context as _, bail};
 use dextr_platform::{CaptureEvent, CaptureHandle, Captured, InjectorHandle};
-use dextr_proto::{Button, DEFAULT_PORT, Hello, Input, Key, MAX_FRAME, Message, Os, PROTOCOL_VERSION, Rect, Side};
-use tokio::{sync::mpsc, time::Instant};
+use dextr_proto::{Beacon, Button, DEFAULT_PORT, Hello, Input, Key, MAX_FRAME, Message, Os, PROTOCOL_VERSION, Rect, Side};
+use tokio::{
+    sync::{mpsc, watch},
+    time::Instant,
+};
 
 use crate::{
     config::{self, Config},
+    discovery::{self, LocalAddress},
     edge,
-    identity::{self, Identity},
-    tls::{self, Trusted},
+    identity::{self, Fingerprint, Identity},
+    tls,
 };
+
+/// The paired device's fingerprint, if any.
+type Trusted = Arc<RwLock<Option<Fingerprint>>>;
+
+/// How long a pairing request waits for both users.
+const PAIRING_TIMEOUT: Duration = Duration::from_secs(120);
+/// A nearby device that stops broadcasting is dropped from the list after this.
+const NEARBY_TIMEOUT: Duration = Duration::from_secs(7);
 
 /// Requests from the UI.
 #[derive(Debug, Clone)]
@@ -32,6 +45,38 @@ pub enum Command {
     ForgetPeer,
     /// Restore every setting to its default (keeps this device's identity).
     ResetSettings,
+    /// Start pairing with the device at this address (`host` or `host:port`).
+    Pair(String),
+    /// The user confirmed (true) or declined/cancelled (false) the pairing.
+    PairDecision(bool),
+}
+
+/// Another dextr device on the local network.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Nearby {
+    pub name: String,
+    pub os: Os,
+    pub address: SocketAddr,
+    pub fingerprint: String,
+    /// It's the device this one is paired with.
+    pub paired: bool,
+}
+
+/// Progress of a pairing.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PairingState {
+    /// Reaching the device at this address.
+    Contacting { address: String },
+    /// Both devices show `code`; waiting for both users to confirm it.
+    Confirm {
+        name: String,
+        os: Os,
+        code: String,
+        /// The other device started it.
+        incoming: bool,
+        we_accepted: bool,
+        they_accepted: bool,
+    },
 }
 
 /// Who owns the pointer right now.
@@ -64,6 +109,14 @@ pub enum Event {
     Config(Config),
     /// Waiting to reconnect, in seconds.
     Reconnecting(u64),
+    /// Pairing started, progressed or ended (`None`).
+    Pairing(Option<PairingState>),
+    /// Why the last pairing didn't complete.
+    PairingFailed(String),
+    /// Other dextr devices on the local network.
+    Nearby(Vec<Nearby>),
+    /// This device's network addresses.
+    Addresses(Vec<LocalAddress>),
     Log(String),
 }
 
@@ -97,6 +150,12 @@ enum Internal {
     InjectorStarted(anyhow::Result<(InjectorHandle, Option<String>)>),
     CaptureStarted(anyhow::Result<(CaptureHandle, mpsc::UnboundedReceiver<CaptureEvent>)>),
     Established(anyhow::Result<Established>),
+    AcceptFailed(String),
+    PairDialed { id: u64, result: anyhow::Result<PairLink> },
+    PairIncoming(PairLink),
+    PairPeerAccepted { id: u64 },
+    PairEnded { id: u64, reason: String },
+    Paired { id: u64, est: Established },
     Inbound { session: u64, message: Message },
     SessionClosed { session: u64, reason: String },
 }
@@ -106,6 +165,31 @@ struct Established {
     send: quinn::SendStream,
     recv: quinn::RecvStream,
     peer: Hello,
+}
+
+/// A connection opened to pair, before both users have confirmed.
+struct PairLink {
+    conn: quinn::Connection,
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+    fingerprint: Fingerprint,
+    name: String,
+    os: Os,
+}
+
+enum Accepted {
+    Session(Established),
+    Pair(PairLink),
+}
+
+struct Pairing {
+    id: u64,
+    state: PairingState,
+    /// Where to reach the device later.
+    address: String,
+    fingerprint: Option<Fingerprint>,
+    /// The user's answers: true confirms, false cancels (at any time).
+    decide: Option<mpsc::UnboundedSender<bool>>,
 }
 
 struct Session {
@@ -141,6 +225,11 @@ struct Engine {
     connecting: bool,
     /// Pointer is pushing against the edge, waiting for the switch delay.
     pending_switch: Option<PendingSwitch>,
+    pairing: Option<Pairing>,
+    next_pairing: u64,
+    nearby: HashMap<Fingerprint, (Nearby, Instant)>,
+    beacon: watch::Sender<Beacon>,
+    addresses: Vec<LocalAddress>,
 }
 
 struct PendingSwitch {
@@ -178,7 +267,7 @@ async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: mpsc::Unbou
         }
     };
     let trusted: Trusted = Arc::new(RwLock::new(identity::parse(&config.peer_fingerprint)));
-    let endpoint = match bind(&identity, trusted.clone(), config.port) {
+    let endpoint = match bind(&identity, config.port) {
         Ok(ep) => Some(ep),
         Err(e) => {
             log(format!("Cannot listen on UDP port {}: {e:#}", config.port));
@@ -192,6 +281,23 @@ async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: mpsc::Unbou
     });
 
     let (internal_tx, mut internal_rx) = mpsc::unbounded_channel();
+
+    let port = endpoint.as_ref().and_then(|e| e.local_addr().ok()).map_or(config.port, |a| a.port());
+    let (beacon, beacon_rx) = watch::channel(Beacon {
+        magic: Beacon::MAGIC,
+        protocol: PROTOCOL_VERSION,
+        name: config.device_name.clone(),
+        os: Os::current(),
+        port,
+        fingerprint: identity.fingerprint,
+    });
+    let (found_tx, mut found_rx) = mpsc::unbounded_channel();
+    if endpoint.is_some() {
+        discovery::spawn(beacon_rx, found_tx);
+    }
+    let addresses = discovery::local_addresses();
+    let _ = events.send(Event::Addresses(addresses.clone()));
+    let mut housekeeping = tokio::time::interval(Duration::from_secs(2));
 
     let mut engine = Engine {
         config,
@@ -216,6 +322,11 @@ async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: mpsc::Unbou
         reconnect_delay: RECONNECT_MIN,
         connecting: false,
         pending_switch: None,
+        pairing: None,
+        next_pairing: 0,
+        nearby: HashMap::new(),
+        beacon,
+        addresses,
     };
     engine.start_backends();
     if engine.config.connection.auto_connect && engine.peer_configured() {
@@ -286,11 +397,18 @@ async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: mpsc::Unbou
                         continue;
                     }
                     let (tx, hello) = (engine.internal.clone(), engine.hello());
+                    let trusted = *engine.trusted.read().unwrap();
                     tokio::spawn(async move {
-                        let _ = tx.send(Internal::Established(accept(incoming, hello).await));
+                        let _ = tx.send(match accept(incoming, hello, trusted).await {
+                            Ok(Accepted::Session(est)) => Internal::Established(Ok(est)),
+                            Ok(Accepted::Pair(link)) => Internal::PairIncoming(link),
+                            Err(e) => Internal::AcceptFailed(format!("{e:#}")),
+                        });
                     });
                 }
             }
+            Some((beacon, from)) = found_rx.recv() => engine.on_beacon(beacon, from),
+            _ = housekeeping.tick() => engine.housekeeping(),
             note = injector_note(&mut injector_watch) => match note {
                 InjectorNote::Screens(screens) => {
                     engine.send(Message::Displays(screens));
@@ -336,18 +454,61 @@ async fn injector_note(injector: &mut Option<InjectorHandle>) -> InjectorNote {
     }
 }
 
-fn bind(id: &Identity, trusted: Trusted, port: u16) -> anyhow::Result<quinn::Endpoint> {
-    let server = tls::server_config(id, trusted)?;
+fn bind(id: &Identity, port: u16) -> anyhow::Result<quinn::Endpoint> {
+    let server = tls::server_config(id)?;
     // Dual-stack first, then IPv4 only.
     quinn::Endpoint::server(server.clone(), SocketAddr::from(([0u16; 8], port)))
         .or_else(|_| quinn::Endpoint::server(server, SocketAddr::from(([0, 0, 0, 0], port))))
         .context("binding the UDP socket")
 }
 
-async fn accept(incoming: quinn::Incoming, hello: Hello) -> anyhow::Result<Established> {
-    let conn = incoming.await.context("incoming connection failed (is the peer paired?)")?;
-    let (send, recv) = conn.accept_bi().await?;
-    exchange_hello(conn, send, recv, hello).await
+/// Answers an incoming connection: a session if it comes from the paired
+/// device, a pairing request, or a refusal.
+async fn accept(incoming: quinn::Incoming, hello: Hello, trusted: Option<Fingerprint>) -> anyhow::Result<Accepted> {
+    let conn = incoming.await.context("incoming connection failed")?;
+    let from = conn.remote_address().ip().to_canonical();
+    let fingerprint = tls::peer_fingerprint(&conn).context("the other device sent no certificate")?;
+    let (mut send, mut recv) = conn.accept_bi().await?;
+    let first = tokio::time::timeout(Duration::from_secs(5), read_message(&mut recv))
+        .await
+        .context("the other device said nothing")??;
+    match first {
+        Message::Hello(peer) if trusted == Some(fingerprint) => {
+            write_message(&mut send, &Message::Hello(hello)).await?;
+            check_protocol(&peer)?;
+            Ok(Accepted::Session(Established { conn, send, recv, peer }))
+        }
+        Message::Hello(peer) => {
+            conn.close(2u32.into(), b"not paired");
+            bail!("refused {} at {from}: it isn't paired with this device", peer.name)
+        }
+        Message::PairRequest { name, os } => {
+            write_message(&mut send, &Message::PairRequest { name: hello.name, os: hello.os }).await?;
+            Ok(Accepted::Pair(PairLink { conn, send, recv, fingerprint, name, os }))
+        }
+        other => bail!("{from} sent {other:?} instead of a greeting"),
+    }
+}
+
+async fn resolve(address: &str) -> anyhow::Result<SocketAddr> {
+    let address = if address.parse::<SocketAddr>().is_ok() || address.rsplit_once(':').is_some_and(|(h, _)| !h.contains(':')) {
+        address.to_owned()
+    } else {
+        format!("{address}:{DEFAULT_PORT}")
+    };
+    tokio::net::lookup_host(&address)
+        .await
+        .with_context(|| format!("cannot resolve {address}"))?
+        .next()
+        .with_context(|| format!("no address for {address}"))
+}
+
+async fn dial(endpoint: &quinn::Endpoint, config: quinn::ClientConfig, address: &str) -> anyhow::Result<quinn::Connection> {
+    let target = resolve(address).await?;
+    tokio::time::timeout(Duration::from_secs(8), endpoint.connect_with(config, target, "dextr")?)
+        .await
+        .context("timed out (is dextr running there, and is UDP allowed through its firewall?)")?
+        .context("connection failed")
 }
 
 async fn connect(
@@ -356,22 +517,89 @@ async fn connect(
     address: String,
     hello: Hello,
 ) -> anyhow::Result<Established> {
-    let address = if address.parse::<SocketAddr>().is_ok() || address.rsplit_once(':').is_some_and(|(h, _)| !h.contains(':')) {
-        address
-    } else {
-        format!("{address}:{DEFAULT_PORT}")
-    };
-    let target = tokio::net::lookup_host(&address)
-        .await
-        .with_context(|| format!("cannot resolve {address}"))?
-        .next()
-        .with_context(|| format!("no address for {address}"))?;
-    let conn = tokio::time::timeout(Duration::from_secs(8), endpoint.connect_with(config, target, "dextr")?)
-        .await
-        .context("timed out (is dextr running there, and is UDP allowed through its firewall?)")?
-        .context("connection failed (check both fingerprints)")?;
+    let conn = dial(&endpoint, config, &address).await?;
     let (send, recv) = conn.open_bi().await?;
     exchange_hello(conn, send, recv, hello).await
+}
+
+/// Opens a pairing connection: any certificate is accepted here because the
+/// users compare a code derived from both before anything is trusted.
+async fn dial_pair(endpoint: quinn::Endpoint, config: quinn::ClientConfig, address: String, name: String) -> anyhow::Result<PairLink> {
+    let conn = dial(&endpoint, config, &address).await?;
+    let fingerprint = tls::peer_fingerprint(&conn).context("the other device sent no certificate")?;
+    let (mut send, mut recv) = conn.open_bi().await?;
+    write_message(&mut send, &Message::PairRequest { name, os: Os::current() }).await?;
+    let answer = tokio::time::timeout(Duration::from_secs(10), read_message(&mut recv))
+        .await
+        .context("no answer")?
+        .context("the other device closed the connection (it may be busy, or not accept incoming connections)")?;
+    match answer {
+        Message::PairRequest { name, os } => Ok(PairLink { conn, send, recv, fingerprint, name, os }),
+        Message::PairReject => bail!("the other device is busy"),
+        other => bail!("unexpected answer {other:?}"),
+    }
+}
+
+/// Waits for both users to confirm, then greets as a normal session.
+async fn pair_conversation(link: PairLink, mut decisions: mpsc::UnboundedReceiver<bool>, hello: Hello, tx: mpsc::UnboundedSender<Internal>, id: u64) {
+    let PairLink { conn, mut send, mut recv, name, .. } = link;
+    let ended = |reason: String| {
+        let _ = tx.send(Internal::PairEnded { id, reason });
+    };
+    {
+        let mut theirs = Box::pin(read_message(&mut recv));
+        let (mut mine_ok, mut theirs_ok) = (false, false);
+        let deadline = tokio::time::sleep(PAIRING_TIMEOUT);
+        tokio::pin!(deadline);
+        while !(mine_ok && theirs_ok) {
+            tokio::select! {
+                d = decisions.recv() => {
+                    if d == Some(true) {
+                        if mine_ok {
+                            continue;
+                        }
+                        mine_ok = true;
+                        if write_message(&mut send, &Message::PairAccept).await.is_err() {
+                            return ended(format!("Lost the connection to {name}."));
+                        }
+                    } else {
+                        let _ = write_message(&mut send, &Message::PairReject).await;
+                        let _ = send.finish();
+                        // Give the reject a moment to arrive before closing.
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        conn.close(0u32.into(), b"declined");
+                        return ended("Pairing cancelled.".into());
+                    }
+                }
+                m = &mut theirs, if !theirs_ok => match m {
+                    Ok(Message::PairAccept) => {
+                        theirs_ok = true;
+                        let _ = tx.send(Internal::PairPeerAccepted { id });
+                    }
+                    Ok(Message::PairReject) => return ended(format!("{name} declined.")),
+                    Ok(other) => return ended(format!("{name} sent {other:?} while pairing.")),
+                    Err(_) => return ended(format!("{name} cancelled or lost the connection.")),
+                },
+                () = &mut deadline => {
+                    conn.close(0u32.into(), b"timeout");
+                    return ended("Nobody confirmed the code in time.".into());
+                }
+            }
+        }
+    }
+    match exchange_hello(conn, send, recv, hello).await {
+        Ok(est) => {
+            let _ = tx.send(Internal::Paired { id, est });
+        }
+        Err(e) => ended(format!("Paired, but connecting failed: {e:#}")),
+    }
+}
+
+fn check_protocol(peer: &Hello) -> anyhow::Result<()> {
+    if peer.protocol != PROTOCOL_VERSION {
+        bail!("peer speaks protocol {} but this build speaks {PROTOCOL_VERSION}; update both", peer.protocol);
+    }
+    Ok(())
 }
 
 async fn exchange_hello(
@@ -385,9 +613,7 @@ async fn exchange_hello(
         Message::Hello(h) => h,
         other => bail!("expected Hello, got {other:?}"),
     };
-    if peer.protocol != PROTOCOL_VERSION {
-        bail!("peer speaks protocol {} but this build speaks {PROTOCOL_VERSION}; update both", peer.protocol);
-    }
+    check_protocol(&peer)?;
     Ok(Established { conn, send, recv, peer })
 }
 
@@ -504,6 +730,10 @@ impl Engine {
                     c.set_side(new.peer_side);
                 }
                 *self.trusted.write().unwrap() = identity::parse(&new.peer_fingerprint);
+                if new.device_name != self.config.device_name {
+                    let name = new.device_name.clone();
+                    self.beacon.send_modify(|b| b.name = name);
+                }
                 if new.port != self.config.port {
                     self.log("The new port takes effect after restarting dextr.".into());
                 }
@@ -541,6 +771,7 @@ impl Engine {
                 self.config.last_peer_name = None;
                 self.config.last_peer_screens.clear();
                 self.save_and_publish("Paired device forgotten.");
+                self.refresh_nearby();
             }
             Command::ResetSettings => {
                 let side_changed = self.config.peer_side != Config::default().peer_side;
@@ -562,6 +793,8 @@ impl Engine {
                 self.save_and_publish("Settings reset to defaults. Pairing, name and port were kept.");
             }
             Command::RetryPermissions => self.start_backends(),
+            Command::Pair(address) => self.start_pairing(address),
+            Command::PairDecision(ok) => self.decide_pairing(ok),
             Command::SetPaused(paused) => {
                 self.paused = paused;
                 if paused && self.mode == Mode::Controlling {
@@ -597,8 +830,216 @@ impl Engine {
                     self.end_session(reason);
                 }
             }
+            Internal::AcceptFailed(reason) => self.log(reason),
+            Internal::PairDialed { id, result } => {
+                if self.pairing.as_ref().is_none_or(|p| p.id != id) {
+                    return; // cancelled meanwhile; dropping the link closes it
+                }
+                match result {
+                    Ok(link) if link.fingerprint == self.identity.fingerprint => self.pairing_failed("That's this device.".into()),
+                    Ok(link) => self.begin_confirm(link, false),
+                    Err(e) => self.pairing_failed(format!("Couldn't reach the device: {e:#}")),
+                }
+            }
+            Internal::PairIncoming(mut link) => {
+                if self.session.is_some() || self.pairing.is_some() {
+                    self.log(format!("Declined a pairing request from {} (busy).", link.name));
+                    tokio::spawn(async move {
+                        let _ = write_message(&mut link.send, &Message::PairReject).await;
+                        let _ = link.send.finish();
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    });
+                    return;
+                }
+                self.next_pairing += 1;
+                let address = SocketAddr::new(link.conn.remote_address().ip().to_canonical(), link.conn.remote_address().port());
+                self.pairing = Some(Pairing {
+                    id: self.next_pairing,
+                    state: PairingState::Contacting { address: address.to_string() },
+                    address: address.to_string(),
+                    fingerprint: None,
+                    decide: None,
+                });
+                self.log(format!("{} wants to pair.", link.name));
+                self.begin_confirm(link, true);
+            }
+            Internal::PairPeerAccepted { id } => {
+                if let Some(p) = self.pairing.as_mut().filter(|p| p.id == id)
+                    && let PairingState::Confirm { they_accepted, .. } = &mut p.state
+                {
+                    *they_accepted = true;
+                    self.publish_pairing();
+                }
+            }
+            Internal::PairEnded { id, reason } => {
+                if self.pairing.as_ref().is_some_and(|p| p.id == id) {
+                    self.pairing_failed(reason);
+                }
+            }
+            Internal::Paired { id, est } => {
+                let Some(p) = self.pairing.take().filter(|p| p.id == id) else { return };
+                let _ = self.events.send(Event::Pairing(None));
+                let Some(fp) = p.fingerprint else { return };
+                *self.trusted.write().unwrap() = Some(fp);
+                self.config.peer_fingerprint = identity::format(&fp);
+                self.config.peer_address = p.address;
+                self.config.last_peer_name = Some(est.peer.name.clone());
+                self.user_disconnected = false;
+                self.save_and_publish(&format!("Paired with {}.", est.peer.name));
+                self.refresh_nearby();
+                self.start_session(est);
+            }
             Internal::InjectorStarted(_) | Internal::CaptureStarted(_) => unreachable!("handled in run()"),
         }
+    }
+
+    fn start_pairing(&mut self, address: String) {
+        let address = address.trim().to_owned();
+        if address.is_empty() {
+            return;
+        }
+        if self.session.is_some() {
+            return self.pairing_failed("Disconnect from the current device first.".into());
+        }
+        if self.pairing.is_some() {
+            return;
+        }
+        let Some(endpoint) = self.endpoint.clone() else {
+            return self.pairing_failed("Networking is unavailable (see Activity).".into());
+        };
+        let client = match tls::client_config(&self.identity, None) {
+            Ok(c) => c,
+            Err(e) => return self.pairing_failed(format!("TLS setup failed: {e:#}")),
+        };
+        self.next_pairing += 1;
+        let id = self.next_pairing;
+        self.pairing = Some(Pairing {
+            id,
+            state: PairingState::Contacting { address: address.clone() },
+            address: address.clone(),
+            fingerprint: None,
+            decide: None,
+        });
+        self.publish_pairing();
+        let (tx, name) = (self.internal.clone(), self.config.device_name.clone());
+        tokio::spawn(async move {
+            let result = dial_pair(endpoint, client, address, name).await;
+            let _ = tx.send(Internal::PairDialed { id, result });
+        });
+    }
+
+    /// Both devices are talking: show the code and wait for the users.
+    fn begin_confirm(&mut self, link: PairLink, incoming: bool) {
+        let Some(p) = self.pairing.as_mut() else { return };
+        let (decide, decisions) = mpsc::unbounded_channel();
+        p.fingerprint = Some(link.fingerprint);
+        p.decide = Some(decide);
+        p.state = PairingState::Confirm {
+            name: link.name.clone(),
+            os: link.os,
+            code: tls::pairing_code(&self.identity.fingerprint, &link.fingerprint),
+            incoming,
+            we_accepted: false,
+            they_accepted: false,
+        };
+        let (id, hello, tx) = (p.id, self.hello(), self.internal.clone());
+        self.publish_pairing();
+        tokio::spawn(pair_conversation(link, decisions, hello, tx, id));
+    }
+
+    fn decide_pairing(&mut self, ok: bool) {
+        let Some(p) = self.pairing.as_mut() else { return };
+        match (&p.decide, &mut p.state) {
+            (Some(decide), PairingState::Confirm { we_accepted, .. }) => {
+                let _ = decide.send(ok);
+                if ok && !*we_accepted {
+                    *we_accepted = true;
+                    self.publish_pairing();
+                }
+                // A cancel ends through PairEnded once it's sent.
+            }
+            _ if !ok => {
+                // Still contacting: forget it; the dial's result is ignored.
+                self.pairing = None;
+                let _ = self.events.send(Event::Pairing(None));
+            }
+            _ => {}
+        }
+    }
+
+    fn pairing_failed(&mut self, reason: String) {
+        self.pairing = None;
+        let _ = self.events.send(Event::Pairing(None));
+        self.log(format!("Pairing: {reason}"));
+        let _ = self.events.send(Event::PairingFailed(reason));
+    }
+
+    fn publish_pairing(&self) {
+        let _ = self.events.send(Event::Pairing(self.pairing.as_ref().map(|p| p.state.clone())));
+    }
+
+    fn on_beacon(&mut self, beacon: Beacon, from: SocketAddr) {
+        if beacon.fingerprint == self.identity.fingerprint || beacon.protocol != PROTOCOL_VERSION {
+            return;
+        }
+        let address = SocketAddr::new(from.ip().to_canonical(), beacon.port);
+        let paired = *self.trusted.read().unwrap() == Some(beacon.fingerprint);
+        let entry = Nearby {
+            name: beacon.name,
+            os: beacon.os,
+            address,
+            fingerprint: identity::format(&beacon.fingerprint),
+            paired,
+        };
+        let changed = self.nearby.get(&beacon.fingerprint).is_none_or(|(n, _)| *n != entry);
+        let name = entry.name.clone();
+        self.nearby.insert(beacon.fingerprint, (entry, Instant::now()));
+        if changed {
+            self.publish_nearby();
+        }
+
+        if paired && self.session.is_none() {
+            // Follow the paired device to its new address.
+            if self.config.peer_address.trim() != address.to_string() {
+                self.config.peer_address = address.to_string();
+                self.save_and_publish(&format!("{name} is now at {address}."));
+            }
+            // It's online: retry now instead of waiting out the backoff. Only
+            // one side does, so the two don't keep dialing each other at once.
+            if self.reconnect_at.is_some() && !self.connecting && self.identity.fingerprint < beacon.fingerprint {
+                self.reconnect_at = None;
+                self.connect();
+            }
+        }
+    }
+
+    /// Drops devices that went quiet, and notices address changes.
+    fn housekeeping(&mut self) {
+        let before = self.nearby.len();
+        self.nearby.retain(|_, (_, seen)| seen.elapsed() < NEARBY_TIMEOUT);
+        if self.nearby.len() != before {
+            self.publish_nearby();
+        }
+        let addresses = discovery::local_addresses();
+        if addresses != self.addresses {
+            self.addresses = addresses.clone();
+            let _ = self.events.send(Event::Addresses(addresses));
+        }
+    }
+
+    /// Re-marks which nearby device is the paired one.
+    fn refresh_nearby(&mut self) {
+        let trusted = *self.trusted.read().unwrap();
+        for (fp, (n, _)) in self.nearby.iter_mut() {
+            n.paired = trusted == Some(*fp);
+        }
+        self.publish_nearby();
+    }
+
+    fn publish_nearby(&self) {
+        let mut list: Vec<Nearby> = self.nearby.values().map(|(n, _)| n.clone()).collect();
+        list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()).then(a.address.cmp(&b.address)));
+        let _ = self.events.send(Event::Nearby(list));
     }
 
     fn peer_configured(&self) -> bool {
@@ -622,14 +1063,14 @@ impl Engine {
             return;
         };
         let Some(fp) = identity::parse(&self.config.peer_fingerprint) else {
-            self.log("Enter the other device's fingerprint first (Pairing page).".into());
+            self.log("Pair with the other device first (Pairing page).".into());
             return;
         };
         if self.config.peer_address.trim().is_empty() {
-            self.log("Enter the other device's address first (Pairing page).".into());
+            self.log("Pair with the other device first (Pairing page).".into());
             return;
         }
-        let client = match tls::client_config(&self.identity, fp) {
+        let client = match tls::client_config(&self.identity, Some(fp)) {
             Ok(c) => c,
             Err(e) => return self.log(format!("TLS setup failed: {e:#}")),
         };
@@ -1005,7 +1446,8 @@ impl Engine {
                 let _ = self.events.send(Event::PeerScreens(displays.clone()));
                 self.remember_peer(&name, &displays);
             }
-            Message::Hello(_) => {}
+            // Only valid before a session starts.
+            Message::Hello(_) | Message::PairRequest { .. } | Message::PairAccept | Message::PairReject => {}
         }
     }
 }
@@ -1028,16 +1470,62 @@ mod tests {
 
     /// Connects `b` to `a`, where `a` trusts `a_trusts`.
     async fn try_pair(a: &Identity, a_trusts: identity::Fingerprint, b: &Identity) -> anyhow::Result<(Established, Established)> {
-        let server = bind(a, Arc::new(RwLock::new(Some(a_trusts))), 0)?;
+        let server = bind(a, 0)?;
         let port = server.local_addr()?.port();
         let client_ep = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0)))?;
         let accept_task = {
             let server = server.clone();
-            tokio::spawn(async move { accept(server.accept().await.unwrap(), hello("A")).await })
+            tokio::spawn(async move { accept(server.accept().await.unwrap(), hello("A"), Some(a_trusts)).await })
         };
-        let dial = connect(client_ep, tls::client_config(b, a.fingerprint)?, format!("127.0.0.1:{port}"), hello("B")).await;
-        let accepted = accept_task.await?;
-        Ok((accepted?, dial?))
+        let dial = connect(client_ep, tls::client_config(b, Some(a.fingerprint))?, format!("127.0.0.1:{port}"), hello("B")).await;
+        let accepted = match accept_task.await?? {
+            Accepted::Session(est) => est,
+            Accepted::Pair(_) => anyhow::bail!("expected a session"),
+        };
+        Ok((accepted, dial?))
+    }
+
+    /// Runs a pairing between fresh devices A (listening) and B (dialing),
+    /// with each user's answer.
+    async fn run_pairing(a_ok: bool, b_ok: bool) -> (Vec<Internal>, Vec<Internal>, String, String) {
+        let (a, b) = (temp_identity(&format!("pa{a_ok}{b_ok}")), temp_identity(&format!("pb{a_ok}{b_ok}")));
+        let server = bind(&a, 0).unwrap();
+        let port = server.local_addr().unwrap().port();
+        let client_ep = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let accept_task = tokio::spawn(async move { accept(server.accept().await.unwrap(), hello("A"), None).await });
+        let at_b = dial_pair(client_ep, tls::client_config(&b, None).unwrap(), format!("127.0.0.1:{port}"), "B".into()).await.unwrap();
+        let Accepted::Pair(at_a) = accept_task.await.unwrap().unwrap() else { panic!("expected a pairing request") };
+        assert_eq!((at_a.name.as_str(), at_b.name.as_str()), ("B", "A"));
+        let code_a = tls::pairing_code(&a.fingerprint, &at_a.fingerprint);
+        let code_b = tls::pairing_code(&b.fingerprint, &at_b.fingerprint);
+
+        let (tx_a, mut rx_a) = mpsc::unbounded_channel();
+        let (tx_b, mut rx_b) = mpsc::unbounded_channel();
+        let (da, decision_a) = mpsc::unbounded_channel();
+        let (db, decision_b) = mpsc::unbounded_channel();
+        let task_a = tokio::spawn(pair_conversation(at_a, decision_a, hello("A"), tx_a, 1));
+        let task_b = tokio::spawn(pair_conversation(at_b, decision_b, hello("B"), tx_b, 1));
+        da.send(a_ok).unwrap();
+        db.send(b_ok).unwrap();
+        task_a.await.unwrap();
+        task_b.await.unwrap();
+        let drain = |rx: &mut mpsc::UnboundedReceiver<Internal>| std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        (drain(&mut rx_a), drain(&mut rx_b), code_a, code_b)
+    }
+
+    #[tokio::test]
+    async fn pairing_by_code_connects_both() {
+        let (at_a, at_b, code_a, code_b) = run_pairing(true, true).await;
+        assert_eq!(code_a, code_b);
+        assert!(matches!(at_a.last(), Some(Internal::Paired { est, .. }) if est.peer.name == "B"));
+        assert!(matches!(at_b.last(), Some(Internal::Paired { est, .. }) if est.peer.name == "A"));
+    }
+
+    #[tokio::test]
+    async fn declined_pairing_ends_on_both_sides() {
+        let (at_a, at_b, _, _) = run_pairing(true, false).await;
+        assert!(matches!(at_a.last(), Some(Internal::PairEnded { .. })));
+        assert!(matches!(at_b.last(), Some(Internal::PairEnded { .. })));
     }
 
     #[tokio::test]

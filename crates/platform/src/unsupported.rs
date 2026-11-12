@@ -1,6 +1,5 @@
-//! Placeholder for macOS and Windows until their backends land.
+//! Placeholder for Windows until its backend lands.
 //!
-//! macOS: capture with a CGEventTap, inject with CGEventPost.
 //! Windows: capture with Raw Input + a low-level hook, inject with SendInput.
 
 use crate::{CaptureCommand, CaptureEvent, InjectCommand, RestoreToken};

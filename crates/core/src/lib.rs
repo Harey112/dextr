@@ -7,6 +7,7 @@
 //! UIs talk to it through two channels: [`Command`]s in, [`Event`]s out.
 
 pub mod config;
+pub mod discovery;
 pub mod edge;
 pub mod identity;
 pub mod settings;
@@ -14,4 +15,5 @@ mod engine;
 mod tls;
 
 pub use config::Config;
-pub use engine::{Command, Event, Mode, spawn};
+pub use discovery::LocalAddress;
+pub use engine::{Command, Event, Mode, Nearby, PairingState, spawn};

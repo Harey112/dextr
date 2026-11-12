@@ -62,6 +62,17 @@ impl Default for Config {
 }
 
 fn hostname() -> String {
+    #[cfg(target_os = "macos")]
+    if let Some(name) = std::process::Command::new("scutil")
+        .args(["--get", "ComputerName"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+    {
+        return name;
+    }
     std::fs::read_to_string("/etc/hostname")
         .ok()
         .map(|s| s.trim().to_owned())
