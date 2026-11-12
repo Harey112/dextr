@@ -1,7 +1,7 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap, HashSet},
     net::SocketAddr,
-    sync::{Arc, RwLock},
+    sync::Arc,
     time::Duration,
 };
 
@@ -19,16 +19,14 @@ use tokio::{
 };
 
 use crate::{
-    config::{self, Config},
+    config::{self, Config, PeerEntry},
     discovery::{self, LocalAddress},
-    edge::{self, Link},
+    edge,
     identity::{self, Fingerprint, Identity},
     settings::DisplayLayout,
     tls,
+    world::{self, Arrangement, DeviceId, World},
 };
-
-/// The paired device's fingerprint, if any.
-type Trusted = Arc<RwLock<Option<Fingerprint>>>;
 
 /// Test only: pretend screens, as `DEXTR_TEST_SCREENS=1920x1080,1280x1024`
 /// (side by side), when no input backend reports real ones.
@@ -58,17 +56,19 @@ const NEARBY_TIMEOUT: Duration = Duration::from_secs(7);
 #[derive(Debug, Clone)]
 pub enum Command {
     /// Save settings and apply what can be applied live.
-    Apply(Config),
-    /// Connect to the configured peer.
-    Connect,
-    Disconnect,
+    Apply(Box<Config>),
+    /// Connect to one paired device, or all of them (`None`).
+    Connect(Option<DeviceId>),
+    /// Disconnect from one device, or all of them (`None`).
+    Disconnect(Option<DeviceId>),
     /// Ask the OS again for any permission that was refused.
     RetryPermissions,
-    /// Pause or resume sending this mouse and keyboard to the peer.
+    /// Pause or resume sending this mouse and keyboard to other devices.
     SetPaused(bool),
-    /// Disconnect and remove the paired device.
-    ForgetPeer,
-    /// Restore every setting to its default (keeps this device's identity).
+    /// Disconnect and remove a paired device.
+    ForgetPeer(DeviceId),
+    /// Restore every setting to its default (keeps this device's identity
+    /// and pairings).
     ResetSettings,
     /// Start pairing with the device at this address (`host` or `host:port`).
     Pair(String),
@@ -83,7 +83,7 @@ pub struct Nearby {
     pub os: Os,
     pub address: SocketAddr,
     pub fingerprint: String,
-    /// It's the device this one is paired with.
+    /// This device is paired with it.
     pub paired: bool,
 }
 
@@ -104,36 +104,39 @@ pub enum PairingState {
     },
 }
 
-/// Who owns the pointer right now.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Who owns this device's pointer right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
     /// Pointer is on this device, used locally.
     Local,
-    /// Our mouse and keyboard drive the peer.
-    Controlling,
-    /// The peer's mouse and keyboard drive this device.
-    Controlled,
+    /// Our mouse and keyboard drive that device.
+    Controlling(DeviceId),
+    /// That device's mouse and keyboard drive this one.
+    Controlled(DeviceId),
 }
 
 /// Notifications for the UI.
 #[derive(Debug, Clone)]
 pub enum Event {
     Ready { config: Config, fingerprint: String, listening: Option<SocketAddr> },
-    /// Local input capture (sending to the peer) is available, or why not.
+    /// Local input capture (sending to other devices) is available, or why not.
     CaptureReady(Result<(), String>),
     /// Local input injection (being controlled) is available, or why not.
     InjectReady(Result<(), String>),
-    Connected { name: String, os: Os, address: SocketAddr, screens: Vec<Rect> },
-    Disconnected { reason: String },
+    Connected { id: DeviceId, name: String, os: Os, address: SocketAddr, screens: Vec<Rect> },
+    Disconnected { id: DeviceId, reason: String },
     /// This device's screens, in logical pixels.
     LocalScreens(Vec<Rect>),
-    /// The connected peer's screens changed.
-    PeerScreens(Vec<Rect>),
+    /// A connected device's screens changed.
+    PeerScreens { id: DeviceId, screens: Vec<Rect> },
     Mode(Mode),
-    /// The saved settings changed in the engine (forget, reset).
+    /// The saved settings changed in the engine (pairing, forget, reset,
+    /// another device's arrangement).
     Config(Config),
-    /// Waiting to reconnect, in seconds.
-    Reconnecting(u64),
+    /// Waiting to reconnect to a device, in seconds (0: not waiting).
+    Reconnecting { id: DeviceId, secs: u64 },
+    /// Dialing a device.
+    Connecting { id: DeviceId },
     /// Pairing started, progressed or ended (`None`).
     Pairing(Option<PairingState>),
     /// Why the last pairing didn't complete.
@@ -173,7 +176,10 @@ const RECONNECT_MAX: Duration = Duration::from_secs(30);
 enum Internal {
     InjectorStarted(anyhow::Result<(InjectorHandle, Option<String>)>),
     CaptureStarted(anyhow::Result<(CaptureHandle, mpsc::UnboundedReceiver<CaptureEvent>)>),
+    /// A connection we accepted.
     Established(anyhow::Result<Established>),
+    /// A connection we dialed to `id`.
+    Dialed { id: DeviceId, result: anyhow::Result<Established> },
     AcceptFailed(String),
     PairDialed { id: u64, result: anyhow::Result<PairLink> },
     PairIncoming(PairLink),
@@ -181,7 +187,7 @@ enum Internal {
     PairEnded { id: u64, reason: String },
     Paired { id: u64, est: Established },
     Inbound { session: u64, message: Message },
-    /// The other device copied something.
+    /// A device copied something.
     Clipboard { session: u64, content: Clipboard },
     SessionClosed { session: u64, reason: String },
 }
@@ -189,6 +195,8 @@ enum Internal {
 struct Established {
     /// This device opened the connection.
     dialed: bool,
+    /// The other device's certificate fingerprint.
+    fingerprint: Fingerprint,
     conn: quinn::Connection,
     send: quinn::SendStream,
     recv: quinn::RecvStream,
@@ -229,35 +237,48 @@ struct Session {
     peer: Hello,
 }
 
+/// Connection state of one paired device.
+#[derive(Default)]
+struct Link {
+    connecting: bool,
+    /// The user disconnected it on purpose: don't reconnect on our own.
+    user_disconnected: bool,
+    reconnect_at: Option<Instant>,
+    delay: Duration,
+}
+
 struct Engine {
     config: Config,
     identity: Arc<Identity>,
-    trusted: Trusted,
+    /// This device, as it appears in the shared arrangement.
+    me: DeviceId,
+    /// Paired devices' fingerprints.
+    trusted: HashSet<Fingerprint>,
     endpoint: Option<quinn::Endpoint>,
     events: mpsc::UnboundedSender<Event>,
     internal: mpsc::UnboundedSender<Internal>,
     capture: Option<CaptureHandle>,
     injector: Option<InjectorHandle>,
-    session: Option<Session>,
+    sessions: HashMap<DeviceId, Session>,
     next_session: u64,
+    links: HashMap<DeviceId, Link>,
     mode: Mode,
-    /// Virtual pointer on the peer, in its coordinates, while controlling.
+    /// This device and the connected devices, placed in the shared space.
+    world: World,
+    /// While controlling: the pointer, in the shared space.
     pointer: (f32, f32),
     ctrl_down: bool,
     alt_down: bool,
     paused: bool,
     starting_capture: bool,
     starting_injector: bool,
-    /// The user disconnected on purpose: don't reconnect on our own.
-    user_disconnected: bool,
-    reconnect_at: Option<Instant>,
-    reconnect_delay: Duration,
-    connecting: bool,
-    /// Pointer is pushing against the edge, waiting for the switch delay.
+    /// Pointer is pushing against an edge, waiting for the switch delay.
     pending_switch: Option<PendingSwitch>,
-    /// The arrangement moved our edge while we controlled the peer; apply it
-    /// once the pointer is back.
-    capture_side_stale: bool,
+    /// The edges to watch changed while we controlled another device; apply
+    /// them once the pointer is back.
+    sides_stale: bool,
+    /// The edges currently watched.
+    sides: Vec<Side>,
     pairing: Option<Pairing>,
     next_pairing: u64,
     nearby: HashMap<Fingerprint, (Nearby, Instant)>,
@@ -268,9 +289,11 @@ struct Engine {
 
 struct PendingSwitch {
     deadline: Instant,
-    /// Where the pointer hit our edge.
+    /// Where the pointer hit our edge, and which edge.
     at: (f32, f32),
-    /// Where it will enter the peer.
+    side: Side,
+    /// The device it will enter, and where.
+    target: DeviceId,
     entry: (f32, f32),
     /// Movement back away from the edge since then.
     retreat: f32,
@@ -300,7 +323,7 @@ async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: mpsc::Unbou
             return;
         }
     };
-    let trusted: Trusted = Arc::new(RwLock::new(identity::parse(&config.peer_fingerprint)));
+    let trusted: HashSet<Fingerprint> = config.peers.keys().filter_map(|id| identity::parse(id)).collect();
     let endpoint = match bind(&identity, config.port) {
         Ok(ep) => Some(ep),
         Err(e) => {
@@ -308,9 +331,10 @@ async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: mpsc::Unbou
             None
         }
     };
+    let me = identity::format(&identity.fingerprint);
     let _ = events.send(Event::Ready {
         config: config.clone(),
-        fingerprint: identity::format(&identity.fingerprint),
+        fingerprint: me.clone(),
         listening: endpoint.as_ref().and_then(|e| e.local_addr().ok()),
     });
 
@@ -345,27 +369,27 @@ async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: mpsc::Unbou
     let mut engine = Engine {
         config,
         identity,
+        me,
         trusted,
         endpoint: endpoint.clone(),
         events: events.clone(),
         internal: internal_tx,
         capture: None,
         injector: None,
-        session: None,
+        sessions: HashMap::new(),
         next_session: 0,
+        links: HashMap::new(),
         mode: Mode::Local,
+        world: World { devices: Vec::new(), proportional: false },
         pointer: (0.0, 0.0),
         ctrl_down: false,
         alt_down: false,
         paused: false,
         starting_capture: false,
         starting_injector: false,
-        user_disconnected: false,
-        reconnect_at: None,
-        reconnect_delay: RECONNECT_MIN,
-        connecting: false,
         pending_switch: None,
-        capture_side_stale: false,
+        sides_stale: false,
+        sides: Vec::new(),
         pairing: None,
         next_pairing: 0,
         nearby: HashMap::new(),
@@ -375,8 +399,9 @@ async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: mpsc::Unbou
     };
     engine.start_backends();
     engine.report_screens();
-    if engine.config.connection.auto_connect && engine.peer_configured() {
-        engine.connect();
+    engine.rebuild_world();
+    if engine.config.connection.auto_connect {
+        engine.connect_all();
     }
     let mut capture_rx: Option<mpsc::UnboundedReceiver<CaptureEvent>> = None;
     // A second handle used only to await injector notifications, so those
@@ -395,7 +420,7 @@ async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: mpsc::Unbou
                     injector_watch = Some(handle.clone());
                     engine.injector = Some(handle);
                     let _ = events.send(Event::InjectReady(Ok(())));
-                    engine.log("Remote input is ready: the other device can control this one.".into());
+                    engine.log("Remote input is ready: other devices can control this one.".into());
                     engine.report_screens();
                     engine.resend_screens();
                     if token.is_some() && token != engine.config.inject_restore_token {
@@ -413,12 +438,14 @@ async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: mpsc::Unbou
                 Internal::CaptureStarted(Ok((handle, rx))) => {
                     engine.starting_capture = false;
                     engine.capture = Some(handle);
-                    engine.sync_capture();
                     capture_rx = Some(rx);
                     let _ = events.send(Event::CaptureReady(Ok(())));
-                    engine.log("Input capture is ready: this mouse and keyboard can move to the other device.".into());
+                    engine.log("Input capture is ready: this mouse and keyboard can move to other devices.".into());
                     engine.report_screens();
                     engine.resend_screens();
+                    engine.sides.clear();
+                    engine.rebuild_world();
+                    engine.sync_capture();
                 }
                 Internal::CaptureStarted(Err(e)) => {
                     engine.starting_capture = false;
@@ -434,12 +461,7 @@ async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: mpsc::Unbou
                     engine.capture = None;
                 }
             },
-            () = sleep_opt(engine.reconnect_at) => {
-                engine.reconnect_at = None;
-                if engine.session.is_none() && !engine.user_disconnected {
-                    engine.connect();
-                }
-            }
+            () = sleep_opt(engine.next_reconnect()) => engine.reconnect_due(),
             () = sleep_opt(engine.pending_switch.as_ref().map(|p| p.deadline)) => engine.commit_switch(),
             incoming = accept_opt(&endpoint) => {
                 if let Some(incoming) = incoming {
@@ -449,9 +471,9 @@ async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: mpsc::Unbou
                         continue;
                     }
                     let (tx, hello) = (engine.internal.clone(), engine.hello());
-                    let trusted = *engine.trusted.read().unwrap();
+                    let trusted = engine.trusted.clone();
                     tokio::spawn(async move {
-                        let _ = tx.send(match accept(incoming, hello, trusted).await {
+                        let _ = tx.send(match accept(incoming, hello, &trusted).await {
                             Ok(Accepted::Session(est)) => Internal::Established(Ok(est)),
                             Ok(Accepted::Pair(link)) => Internal::PairIncoming(link),
                             Err(e) => Internal::AcceptFailed(format!("{e:#}")),
@@ -464,7 +486,7 @@ async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: mpsc::Unbou
             _ = housekeeping.tick() => engine.housekeeping(),
             note = injector_note(&mut injector_watch) => match note {
                 InjectorNote::Screens(screens) => {
-                    engine.send(Message::Displays(screens));
+                    engine.broadcast(Message::Displays(screens));
                     engine.report_screens();
                 }
                 InjectorNote::Stopped(reason) => {
@@ -475,7 +497,9 @@ async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: mpsc::Unbou
             },
         }
     }
-    engine.end_session("app closed".into());
+    for id in engine.sessions.keys().cloned().collect::<Vec<_>>() {
+        engine.end_session(&id, "app closed".into());
+    }
 }
 
 async fn recv_opt<T>(rx: &mut Option<mpsc::UnboundedReceiver<T>>) -> Option<T> {
@@ -517,7 +541,7 @@ fn bind(id: &Identity, port: u16) -> anyhow::Result<quinn::Endpoint> {
 
 /// Answers an incoming connection: a session if it comes from the paired
 /// device, a pairing request, or a refusal.
-async fn accept(incoming: quinn::Incoming, hello: Hello, trusted: Option<Fingerprint>) -> anyhow::Result<Accepted> {
+async fn accept(incoming: quinn::Incoming, hello: Hello, trusted: &HashSet<Fingerprint>) -> anyhow::Result<Accepted> {
     let conn = incoming.await.context("incoming connection failed")?;
     let from = conn.remote_address().ip().to_canonical();
     let fingerprint = tls::peer_fingerprint(&conn).context("the other device sent no certificate")?;
@@ -526,10 +550,10 @@ async fn accept(incoming: quinn::Incoming, hello: Hello, trusted: Option<Fingerp
         .await
         .context("the other device said nothing")??;
     match first {
-        Message::Hello(peer) if trusted == Some(fingerprint) => {
+        Message::Hello(peer) if trusted.contains(&fingerprint) => {
             write_message(&mut send, &Message::Hello(hello)).await?;
             check_protocol(&peer)?;
-            Ok(Accepted::Session(Established { dialed: false, conn, send, recv, peer }))
+            Ok(Accepted::Session(Established { dialed: false, fingerprint, conn, send, recv, peer }))
         }
         Message::Hello(peer) => {
             conn.close(2u32.into(), b"not paired");
@@ -569,10 +593,11 @@ async fn connect(
     config: quinn::ClientConfig,
     address: String,
     hello: Hello,
+    fingerprint: Fingerprint,
 ) -> anyhow::Result<Established> {
     let conn = dial(&endpoint, config, &address).await?;
     let (send, recv) = conn.open_bi().await?;
-    exchange_hello(conn, send, recv, hello, true).await
+    exchange_hello(conn, send, recv, hello, true, fingerprint).await
 }
 
 /// Opens a pairing connection: any certificate is accepted here because the
@@ -595,7 +620,7 @@ async fn dial_pair(endpoint: quinn::Endpoint, config: quinn::ClientConfig, addre
 
 /// Waits for both users to confirm, then greets as a normal session.
 async fn pair_conversation(link: PairLink, mut decisions: mpsc::UnboundedReceiver<bool>, hello: Hello, tx: mpsc::UnboundedSender<Internal>, id: u64) {
-    let PairLink { conn, mut send, mut recv, name, dialed, .. } = link;
+    let PairLink { conn, mut send, mut recv, name, dialed, fingerprint, .. } = link;
     let ended = |reason: String| {
         let _ = tx.send(Internal::PairEnded { id, reason });
     };
@@ -640,7 +665,7 @@ async fn pair_conversation(link: PairLink, mut decisions: mpsc::UnboundedReceive
             }
         }
     }
-    match exchange_hello(conn, send, recv, hello, dialed).await {
+    match exchange_hello(conn, send, recv, hello, dialed, fingerprint).await {
         Ok(est) => {
             let _ = tx.send(Internal::Paired { id, est });
         }
@@ -688,6 +713,7 @@ async fn exchange_hello(
     mut recv: quinn::RecvStream,
     hello: Hello,
     dialed: bool,
+    fingerprint: Fingerprint,
 ) -> anyhow::Result<Established> {
     write_message(&mut send, &Message::Hello(hello)).await?;
     let peer = match tokio::time::timeout(Duration::from_secs(5), read_message(&mut recv)).await?? {
@@ -695,7 +721,7 @@ async fn exchange_hello(
         other => bail!("expected Hello, got {other:?}"),
     };
     check_protocol(&peer)?;
-    Ok(Established { dialed, conn, send, recv, peer })
+    Ok(Established { dialed, fingerprint, conn, send, recv, peer })
 }
 
 async fn write_message(send: &mut quinn::SendStream, msg: &Message) -> anyhow::Result<()> {
@@ -736,23 +762,24 @@ impl Engine {
         self.starting_injector |= need_injector;
         self.starting_capture |= need_capture;
         let tx = self.internal.clone();
-        let (restore, side) = (self.config.inject_restore_token.clone(), self.config.peer_side);
+        let restore = self.config.inject_restore_token.clone();
         tokio::spawn(async move {
             if need_injector {
                 let _ = tx.send(Internal::InjectorStarted(dextr_platform::start_injector(restore).await));
             }
             if need_capture {
-                let _ = tx.send(Internal::CaptureStarted(dextr_platform::start_capture(side).await));
+                // Edges are set once the arrangement is known.
+                let _ = tx.send(Internal::CaptureStarted(dextr_platform::start_capture(Vec::new()).await));
             }
         });
     }
 
-    /// Edge watching is on only while connected, not paused, and not being
-    /// controlled by the peer.
+    /// Edge watching is on while some device is connected next to us, sharing
+    /// isn't paused, and no device is controlling this one.
     fn sync_capture(&self) {
         if let Some(c) = &self.capture {
-            let mouse_out = self.config.mouse.enabled && self.config.peer_rules().send.mouse;
-            if self.session.is_some() && !self.paused && mouse_out && self.mode != Mode::Controlled {
+            let controlled = matches!(self.mode, Mode::Controlled(_));
+            if !self.sessions.is_empty() && !self.paused && self.config.mouse.enabled && !controlled && !self.sides.is_empty() {
                 c.enable();
             } else {
                 c.disable();
@@ -760,12 +787,12 @@ impl Engine {
         }
     }
 
-    /// Tells the peer our screens again, e.g. once a backend that knows
-    /// them has started after we connected.
+    /// Tells connected devices our screens again, e.g. once a backend that
+    /// knows them has started after we connected.
     fn resend_screens(&self) {
         let displays = self.hello().displays;
         if !displays.is_empty() {
-            self.send(Message::Displays(displays));
+            self.broadcast(Message::Displays(displays));
         }
     }
 
@@ -775,29 +802,15 @@ impl Engine {
 
     fn set_mode(&mut self, mode: Mode) {
         if self.mode != mode {
-            self.mode = mode;
+            self.mode = mode.clone();
             let _ = self.events.send(Event::Mode(mode));
         }
-        if mode != Mode::Controlling && self.capture_side_stale {
-            self.update_capture_side();
+        if !matches!(self.mode, Mode::Controlling(_)) && self.sides_stale {
+            self.update_sides();
         }
     }
 
-    /// Moves edge watching to the configured side. Not while controlling
-    /// the peer: re-arming the edge can end the capture and drop the pointer
-    /// back here, so it waits until the pointer comes home.
-    fn update_capture_side(&mut self) {
-        if self.mode == Mode::Controlling {
-            self.capture_side_stale = true;
-            return;
-        }
-        self.capture_side_stale = false;
-        if let Some(c) = &self.capture {
-            c.set_side(self.config.peer_side);
-        }
-    }
-
-    /// Our screens in the coordinate space the peer should use for Motion.
+    /// Our screens in the coordinate space others should use for Motion.
     fn hello(&self) -> Hello {
         let from_injector = self.injector.as_ref().map(|i| i.screens()).unwrap_or_default();
         let displays = if from_injector.is_empty() {
@@ -809,23 +822,28 @@ impl Engine {
         Hello { protocol: PROTOCOL_VERSION, name: self.config.device_name.clone(), os: Os::current(), displays }
     }
 
+    /// Our screens as the capture backend sees them (the coordinates it
+    /// reports and accepts).
     fn our_screens(&self) -> Vec<Rect> {
-        self.capture.as_ref().map(|c| c.screens()).unwrap_or_default()
+        let s = self.capture.as_ref().map(|c| c.screens()).unwrap_or_default();
+        if s.is_empty() { self.hello().displays } else { s }
     }
 
-    fn peer_screens(&self) -> &[Rect] {
-        self.session.as_ref().map(|s| s.peer.displays.as_slice()).unwrap_or(&[])
-    }
-
-    fn send(&self, msg: Message) {
-        if let Some(s) = &self.session {
+    fn send_to(&self, id: &str, msg: Message) {
+        if let Some(s) = self.sessions.get(id) {
             let _ = s.out.send(msg);
         }
     }
 
+    fn broadcast(&self, msg: Message) {
+        for s in self.sessions.values() {
+            let _ = s.out.send(msg.clone());
+        }
+    }
+
     /// Unreliable and unordered: only for absolute pointer motion.
-    fn send_motion(&self, x: f32, y: f32) {
-        if let Some(s) = &self.session
+    fn send_motion(&self, id: &str, (x, y): (f32, f32)) {
+        if let Some(s) = self.sessions.get(id)
             && let Ok(bytes) = Message::Input(Input::Motion { x, y }).to_bytes()
             && s.conn.send_datagram(bytes.into()).is_err()
         {
@@ -834,13 +852,137 @@ impl Engine {
         }
     }
 
+    fn peer_name(&self, id: &str) -> String {
+        self.sessions
+            .get(id)
+            .map(|s| s.peer.name.clone())
+            .or_else(|| self.config.peers.get(id).map(|p| p.name.clone()))
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "the other device".into())
+    }
+
+    // ── Shared arrangement ──────────────────────────────────────────────
+
+    /// Places this device and the connected devices, and watches the edges
+    /// that lead somewhere.
+    fn rebuild_world(&mut self) {
+        let mut screens: BTreeMap<DeviceId, Vec<Rect>> = self.sessions.iter().map(|(id, s)| (id.clone(), s.peer.displays.clone())).collect();
+        screens.insert(self.me.clone(), self.our_screens());
+        self.world = World::build(
+            &self.config.arrangement,
+            self.config.layout == DisplayLayout::Proportional,
+            &self.me,
+            &screens,
+            self.config.new_device_side,
+        );
+        self.adopt_placements();
+        self.update_sides();
+    }
+
+    /// Devices placed automatically (not arranged yet) are written into the
+    /// shared arrangement and sent to everyone, so every device ends up with
+    /// the same layout. Automatic placements keep the arrangement's time (1 if
+    /// never arranged), so an arrangement someone made always wins, and among
+    /// equal times the lowest fingerprint's does.
+    fn adopt_placements(&mut self) {
+        let a = &mut self.config.arrangement;
+        let mut added = false;
+        if self.world.proportional {
+            for d in &self.world.devices {
+                if !a.row.contains(&d.id) {
+                    added = true;
+                }
+            }
+            if added {
+                a.row = self.world.devices.iter().map(|d| d.id.clone()).collect();
+            }
+        } else {
+            for d in &self.world.devices {
+                if !a.origins.contains_key(&d.id) {
+                    a.origins.insert(d.id.clone(), (d.origin.0.round() as i32, d.origin.1.round() as i32));
+                    added = true;
+                }
+            }
+        }
+        if !added {
+            return;
+        }
+        a.changed_at = a.changed_at.max(1);
+        if let Err(e) = self.config.save() {
+            tracing::warn!("saving the arrangement: {e:#}");
+        }
+        let _ = self.events.send(Event::Config(self.config.clone()));
+        self.broadcast(self.layout_message());
+    }
+
+    /// Watches the edges with a device past them. Not while controlling
+    /// another device: re-arming the edges can end the capture and drop the
+    /// pointer back here, so it waits until the pointer comes home.
+    fn update_sides(&mut self) {
+        if matches!(self.mode, Mode::Controlling(_)) {
+            self.sides_stale = true;
+            return;
+        }
+        self.sides_stale = false;
+        let sides = self.world.sides_with_neighbors(&self.me);
+        if sides != self.sides {
+            self.sides = sides.clone();
+            if let Some(c) = &self.capture {
+                c.set_sides(sides);
+            }
+            self.sync_capture();
+        }
+    }
+
+    fn layout_message(&self) -> Message {
+        let fp = |id: &DeviceId| identity::parse(id);
+        let a = &self.config.arrangement;
+        Message::Layout {
+            proportional: self.config.layout == DisplayLayout::Proportional,
+            origins: a.origins.iter().filter_map(|(id, &(x, y))| Some((fp(id)?, x, y))).collect(),
+            row: a.row.iter().filter_map(fp).collect(),
+            changed_at: a.changed_at,
+        }
+    }
+
+    /// Another device's arrangement: keep it if it's newer than ours.
+    fn peer_layout(&mut self, from: &str, proportional: bool, origins: Vec<([u8; 32], i32, i32)>, row: Vec<[u8; 32]>, changed_at: u64) {
+        let ours = self.config.arrangement.changed_at;
+        // Same instant (or never arranged): the lower fingerprint wins.
+        let sender_lower = identity::parse(from).is_some_and(|fp| fp < self.identity.fingerprint);
+        if changed_at < ours || (changed_at == ours && (changed_at == 0 || !sender_lower)) {
+            return;
+        }
+        let arrangement = Arrangement {
+            origins: origins.into_iter().map(|(fp, x, y)| (identity::format(&fp), (x, y))).collect(),
+            row: row.iter().map(identity::format).collect(),
+            changed_at,
+        };
+        let layout = if proportional { DisplayLayout::Proportional } else { DisplayLayout::Exact };
+        let changed = arrangement.origins != self.config.arrangement.origins
+            || arrangement.row != self.config.arrangement.row
+            || layout != self.config.layout;
+        self.config.arrangement = arrangement;
+        self.config.layout = layout;
+        if changed {
+            let name = self.peer_name(from);
+            self.save_and_publish(&format!("Display arrangement updated to match {name}."));
+            self.rebuild_world();
+        } else {
+            let _ = self.config.save();
+        }
+    }
+
+    // ── Commands ────────────────────────────────────────────────────────
+
     fn command(&mut self, command: Command) {
         match command {
-            Command::Apply(mut new) => {
-                let side_changed = new.peer_side != self.config.peer_side;
-                let rearranged = new.link() != self.config.link();
-                new.arranged_at = if rearranged { now_ms() } else { self.config.arranged_at };
-                *self.trusted.write().unwrap() = identity::parse(&new.peer_fingerprint);
+            Command::Apply(new) => {
+                let mut new = *new;
+                let rearranged = new.layout != self.config.layout
+                    || new.arrangement.origins != self.config.arrangement.origins
+                    || new.arrangement.row != self.config.arrangement.row;
+                new.arrangement.changed_at = if rearranged { now_ms() } else { self.config.arrangement.changed_at };
                 if new.device_name != self.config.device_name {
                     let name = new.device_name.clone();
                     self.beacon.send_modify(|b| b.name = name);
@@ -848,79 +990,88 @@ impl Engine {
                 if new.port != self.config.port {
                     self.log("The new port takes effect after restarting dextr.".into());
                 }
-                let old = std::mem::take(&mut self.config);
-                self.config = Config {
-                    inject_restore_token: old.inject_restore_token,
-                    last_peer_name: old.last_peer_name,
-                    last_peer_screens: old.last_peer_screens,
-                    ..new
-                };
+                // The engine owns pairings and what it learns about devices;
+                // the UI owns their sharing rules.
+                let mut peers = self.config.peers.clone();
+                for (id, entry) in &mut peers {
+                    if let Some(edited) = new.peers.get(id) {
+                        entry.send = edited.send;
+                        entry.receive = edited.receive;
+                    }
+                }
+                let token = self.config.inject_restore_token.take();
+                self.config = Config { peers, inject_restore_token: token, ..new };
                 match self.config.save() {
                     Ok(()) => self.log("Settings saved.".into()),
                     Err(e) => self.log(format!("Cannot save settings: {e:#}")),
                 }
-                // Master switches and device rules can turn edge watching on or off.
-                self.sync_capture();
-                if side_changed {
-                    self.update_capture_side();
-                }
                 if rearranged {
-                    self.send_arrangement();
+                    self.broadcast(self.layout_message());
+                    self.rebuild_world();
+                }
+                // Master switches can turn edge watching on or off.
+                self.sync_capture();
+            }
+            Command::Connect(None) => self.connect_all(),
+            Command::Connect(Some(id)) => {
+                let link = self.links.entry(id.clone()).or_default();
+                link.user_disconnected = false;
+                link.delay = RECONNECT_MIN;
+                link.reconnect_at = None;
+                self.connect(&id);
+            }
+            Command::Disconnect(target) => {
+                let ids: Vec<DeviceId> = match target {
+                    Some(id) => vec![id],
+                    None => self.config.peers.keys().cloned().collect(),
+                };
+                for id in ids {
+                    let link = self.links.entry(id.clone()).or_default();
+                    link.user_disconnected = true;
+                    link.reconnect_at = None;
+                    let _ = self.events.send(Event::Reconnecting { id: id.clone(), secs: 0 });
+                    self.end_session(&id, "disconnected".into());
                 }
             }
-            Command::Connect => {
-                self.user_disconnected = false;
-                self.reconnect_delay = RECONNECT_MIN;
-                self.reconnect_at = None;
-                self.connect();
-            }
-            Command::Disconnect => {
-                self.user_disconnected = true;
-                self.reconnect_at = None;
-                let _ = self.events.send(Event::Reconnecting(0));
-                self.end_session("disconnected".into());
-            }
-            Command::ForgetPeer => {
-                self.user_disconnected = true;
-                self.reconnect_at = None;
-                self.end_session("device forgotten".into());
-                *self.trusted.write().unwrap() = None;
-                self.config.peer_address.clear();
-                self.config.peer_fingerprint.clear();
-                self.config.last_peer_name = None;
-                self.config.last_peer_screens.clear();
-                self.save_and_publish("Paired device forgotten.");
+            Command::ForgetPeer(id) => {
+                self.links.entry(id.clone()).or_default().user_disconnected = true;
+                self.end_session(&id, "device forgotten".into());
+                self.links.remove(&id);
+                if let Some(fp) = identity::parse(&id) {
+                    self.trusted.remove(&fp);
+                }
+                let name = self.config.peers.remove(&id).map(|p| p.name).unwrap_or_default();
+                self.config.arrangement.origins.remove(&id);
+                self.config.arrangement.row.retain(|d| d != &id);
+                self.save_and_publish(&format!("Forgot {}.", if name.is_empty() { "the device" } else { &name }));
                 self.refresh_nearby();
+                self.rebuild_world();
             }
             Command::ResetSettings => {
-                let side_changed = self.config.peer_side != Config::default().peer_side;
                 self.config = Config {
                     inject_restore_token: self.config.inject_restore_token.take(),
-                    peer_address: std::mem::take(&mut self.config.peer_address),
-                    peer_fingerprint: std::mem::take(&mut self.config.peer_fingerprint),
-                    last_peer_name: self.config.last_peer_name.take(),
-                    last_peer_screens: std::mem::take(&mut self.config.last_peer_screens),
+                    peers: std::mem::take(&mut self.config.peers)
+                        .into_iter()
+                        .map(|(id, p)| (id, PeerEntry { send: Default::default(), receive: Default::default(), ..p }))
+                        .collect(),
                     port: self.config.port,
                     device_name: std::mem::take(&mut self.config.device_name),
                     ..Config::default()
                 };
-                if side_changed {
-                    self.update_capture_side();
-                }
+                self.config.arrangement.changed_at = now_ms();
                 self.paused = false;
+                self.save_and_publish("Settings reset to defaults. Pairings, name and port were kept.");
+                self.broadcast(self.layout_message());
+                self.rebuild_world();
                 self.sync_capture();
-                self.config.arranged_at = now_ms();
-                self.save_and_publish("Settings reset to defaults. Pairing, name and port were kept.");
-                self.send_arrangement();
             }
             Command::RetryPermissions => self.start_backends(),
             Command::Pair(address) => self.start_pairing(address),
             Command::PairDecision(ok) => self.decide_pairing(ok),
             Command::SetPaused(paused) => {
                 self.paused = paused;
-                if paused && self.mode == Mode::Controlling {
-                    let (x, y) = self.pointer;
-                    self.leave_to_local(x, y);
+                if paused && matches!(self.mode, Mode::Controlling(_)) {
+                    self.leave_to_local(self.pointer);
                 }
                 self.sync_capture();
                 self.log(if paused { "Sharing paused." } else { "Sharing resumed." }.into());
@@ -931,24 +1082,31 @@ impl Engine {
     fn internal(&mut self, msg: Internal) {
         match msg {
             Internal::Established(Ok(est)) => self.start_session(est),
-            Internal::Established(Err(e)) => {
-                let quiet = self.connecting && self.reconnect_delay > RECONNECT_MIN;
-                let was_dialing = std::mem::take(&mut self.connecting);
-                if !quiet {
-                    self.log(format!("Connection failed: {e:#}"));
-                }
-                if was_dialing {
-                    self.schedule_reconnect();
+            Internal::Established(Err(e)) => self.log(format!("Connection failed: {e:#}")),
+            Internal::Dialed { id, result } => {
+                let link = self.links.entry(id.clone()).or_default();
+                link.connecting = false;
+                match result {
+                    Ok(est) => self.start_session(est),
+                    Err(e) => {
+                        let quiet = link.delay > RECONNECT_MIN;
+                        if !quiet {
+                            let name = self.peer_name(&id);
+                            self.log(format!("Connection to {name} failed: {e:#}"));
+                        }
+                        self.schedule_reconnect(&id);
+                    }
                 }
             }
             Internal::Inbound { session, message } => {
-                if self.session.as_ref().is_some_and(|s| s.id == session) {
-                    self.inbound(message);
+                if let Some(id) = self.session_id(session) {
+                    self.inbound(&id, message);
                 }
             }
             Internal::SessionClosed { session, reason } => {
-                if self.session.as_ref().is_some_and(|s| s.id == session) {
-                    self.end_session(reason);
+                if let Some(id) = self.session_id(session) {
+                    self.end_session(&id, reason);
+                    self.schedule_reconnect(&id);
                 }
             }
             Internal::AcceptFailed(reason) => self.log(reason),
@@ -963,7 +1121,7 @@ impl Engine {
                 }
             }
             Internal::PairIncoming(mut link) => {
-                if self.session.is_some() || self.pairing.is_some() {
+                if self.pairing.is_some() {
                     self.log(format!("Declined a pairing request from {} (busy).", link.name));
                     tokio::spawn(async move {
                         let _ = write_message(&mut link.send, &Message::PairReject).await;
@@ -1000,34 +1158,36 @@ impl Engine {
             Internal::Paired { id, est } => {
                 let Some(p) = self.pairing.take().filter(|p| p.id == id) else { return };
                 let _ = self.events.send(Event::Pairing(None));
-                let Some(fp) = p.fingerprint else { return };
-                *self.trusted.write().unwrap() = Some(fp);
-                self.config.peer_fingerprint = identity::format(&fp);
-                self.config.peer_address = p.address;
-                self.config.last_peer_name = Some(est.peer.name.clone());
-                self.user_disconnected = false;
+                let fp = est.fingerprint;
+                let device = identity::format(&fp);
+                self.trusted.insert(fp);
+                let entry = self.config.peers.entry(device.clone()).or_default();
+                entry.name = est.peer.name.clone();
+                entry.address = p.address;
+                entry.os = Some(est.peer.os);
+                self.links.entry(device).or_default().user_disconnected = false;
                 self.save_and_publish(&format!("Paired with {}.", est.peer.name));
                 self.refresh_nearby();
                 self.start_session(est);
             }
             Internal::Clipboard { session, content } => {
-                if self.session.as_ref().is_some_and(|s| s.id == session) {
-                    self.peer_clipboard(content);
+                if let Some(id) = self.session_id(session) {
+                    self.peer_clipboard(&id, content);
                 }
             }
             Internal::InjectorStarted(_) | Internal::CaptureStarted(_) => unreachable!("handled in run()"),
         }
     }
 
+    fn session_id(&self, session: u64) -> Option<DeviceId> {
+        self.sessions.iter().find(|(_, s)| s.id == session).map(|(id, _)| id.clone())
+    }
+
+    // ── Pairing ─────────────────────────────────────────────────────────
+
     fn start_pairing(&mut self, address: String) {
         let address = address.trim().to_owned();
-        if address.is_empty() {
-            return;
-        }
-        if self.session.is_some() {
-            return self.pairing_failed("Disconnect from the current device first.".into());
-        }
-        if self.pairing.is_some() {
+        if address.is_empty() || self.pairing.is_some() {
             return;
         }
         let Some(endpoint) = self.endpoint.clone() else {
@@ -1104,19 +1264,16 @@ impl Engine {
         let _ = self.events.send(Event::Pairing(self.pairing.as_ref().map(|p| p.state.clone())));
     }
 
+    // ── Discovery ───────────────────────────────────────────────────────
+
     fn on_beacon(&mut self, beacon: Beacon, from: SocketAddr) {
         if beacon.fingerprint == self.identity.fingerprint || beacon.protocol != PROTOCOL_VERSION {
             return;
         }
         let address = SocketAddr::new(from.ip().to_canonical(), beacon.port);
-        let paired = *self.trusted.read().unwrap() == Some(beacon.fingerprint);
-        let entry = Nearby {
-            name: beacon.name,
-            os: beacon.os,
-            address,
-            fingerprint: identity::format(&beacon.fingerprint),
-            paired,
-        };
+        let paired = self.trusted.contains(&beacon.fingerprint);
+        let id = identity::format(&beacon.fingerprint);
+        let entry = Nearby { name: beacon.name, os: beacon.os, address, fingerprint: id.clone(), paired };
         let changed = self.nearby.get(&beacon.fingerprint).is_none_or(|(n, _)| *n != entry);
         let name = entry.name.clone();
         self.nearby.insert(beacon.fingerprint, (entry, Instant::now()));
@@ -1124,22 +1281,25 @@ impl Engine {
             self.publish_nearby();
         }
 
-        if paired && self.session.is_none() {
-            // Follow the paired device to its new address.
-            if self.config.peer_address.trim() != address.to_string() {
-                self.config.peer_address = address.to_string();
+        if paired && !self.sessions.contains_key(&id) {
+            // Follow the device to its new address.
+            if let Some(p) = self.config.peers.get_mut(&id)
+                && p.address.trim() != address.to_string()
+            {
+                p.address = address.to_string();
                 self.save_and_publish(&format!("{name} is now at {address}."));
             }
             // It's online: retry now instead of waiting out the backoff. Only
             // one side does, so the two don't keep dialing each other at once.
-            if self.reconnect_at.is_some() && !self.connecting && self.identity.fingerprint < beacon.fingerprint {
-                self.reconnect_at = None;
-                self.connect();
+            let link = self.links.entry(id.clone()).or_default();
+            if link.reconnect_at.is_some() && !link.connecting && self.identity.fingerprint < beacon.fingerprint {
+                link.reconnect_at = None;
+                self.connect(&id);
             }
         }
     }
 
-    /// Drops devices that went quiet, and notices address changes.
+    /// Drops devices that went quiet, and notices address and screen changes.
     fn housekeeping(&mut self) {
         let before = self.nearby.len();
         self.nearby.retain(|_, (_, seen)| seen.elapsed() < NEARBY_TIMEOUT);
@@ -1151,13 +1311,16 @@ impl Engine {
             self.addresses = addresses.clone();
             let _ = self.events.send(Event::Addresses(addresses));
         }
+        // Our screens changed (a monitor plugged in): place them again.
+        if self.world.device(&self.me).is_none_or(|d| d.screens != self.our_screens()) {
+            self.rebuild_world();
+        }
     }
 
-    /// Re-marks which nearby device is the paired one.
+    /// Re-marks which nearby devices are paired.
     fn refresh_nearby(&mut self) {
-        let trusted = *self.trusted.read().unwrap();
         for (fp, (n, _)) in self.nearby.iter_mut() {
-            n.paired = trusted == Some(*fp);
+            n.paired = self.trusted.contains(fp);
         }
         self.publish_nearby();
     }
@@ -1168,47 +1331,12 @@ impl Engine {
         let _ = self.events.send(Event::Nearby(list));
     }
 
-    // ── Display arrangement ─────────────────────────────────────────────
-
-    fn send_arrangement(&self) {
-        let link = self.config.link();
-        self.send(Message::Arrangement {
-            side: link.side,
-            offset: link.offset,
-            proportional: link.proportional,
-            changed_at: self.config.arranged_at,
-        });
-    }
-
-    /// The other device's arrangement: mirror it if it's newer than ours.
-    fn peer_arranged(&mut self, theirs: Link, changed_at: u64) {
-        let ours = self.config.arranged_at;
-        // Same instant (or neither ever arranged): the lower fingerprint wins.
-        let peer_lower = self.trusted.read().unwrap().is_some_and(|peer| peer < self.identity.fingerprint);
-        if changed_at < ours || (changed_at == ours && (changed_at == 0 || !peer_lower)) {
-            return;
-        }
-        let link = theirs.mirrored();
-        self.config.arranged_at = changed_at;
-        if link == self.config.link() {
-            let _ = self.config.save();
-            return;
-        }
-        self.config.peer_side = link.side;
-        self.config.peer_offset = link.offset;
-        self.config.layout = if link.proportional { DisplayLayout::Proportional } else { DisplayLayout::Exact };
-        self.update_capture_side();
-        let name = self.session.as_ref().map(|s| s.peer.name.clone()).unwrap_or_default();
-        self.save_and_publish(&format!("Display arrangement updated to match {name}."));
-    }
-
     // ── Clipboard ───────────────────────────────────────────────────────
 
-    /// Something was copied here: send it to the other device.
+    /// Something was copied here: send it to every device allowed to get it.
     fn local_clipboard(&mut self, content: ClipContent) {
         let c = &self.config.clipboard;
-        let Some(session) = &self.session else { return };
-        if !c.enabled || !self.config.peer_rules().send.clipboard {
+        if !c.enabled || self.sessions.is_empty() {
             return;
         }
         let (message, what) = match content {
@@ -1230,25 +1358,34 @@ impl Engine {
             self.log(format!("Didn't share the clipboard: {what} is over the {} MB limit.", c.max_mb));
             return;
         }
-        tracing::debug!("sharing the clipboard: {what}");
-        let conn = session.conn.clone();
-        tokio::spawn(async move {
-            let result = async {
-                let mut out = conn.open_uni().await?;
-                out.write_all(&message.to_frame()?).await?;
-                out.finish()?;
-                anyhow::Ok(())
-            };
-            if let Err(e) = result.await {
-                tracing::debug!("clipboard not sent: {e:#}");
+        let frame = match message.to_frame() {
+            Ok(f) => Arc::new(f),
+            Err(e) => return tracing::debug!("clipboard not encoded: {e}"),
+        };
+        for (id, session) in &self.sessions {
+            if !self.config.peer(id).send.clipboard {
+                continue;
             }
-        });
+            tracing::debug!("sharing the clipboard with {}: {what}", session.peer.name);
+            let (conn, frame) = (session.conn.clone(), frame.clone());
+            tokio::spawn(async move {
+                let result = async {
+                    let mut out = conn.open_uni().await?;
+                    out.write_all(&frame).await?;
+                    out.finish()?;
+                    anyhow::Ok(())
+                };
+                if let Err(e) = result.await {
+                    tracing::debug!("clipboard not sent: {e:#}");
+                }
+            });
+        }
     }
 
-    /// The other device copied something: put it on our clipboard.
-    fn peer_clipboard(&mut self, content: Clipboard) {
+    /// A device copied something: put it on our clipboard.
+    fn peer_clipboard(&mut self, from: &str, content: Clipboard) {
         let c = &self.config.clipboard;
-        if !c.enabled || !self.config.peer_rules().receive.clipboard {
+        if !c.enabled || !self.config.peer(from).receive.clipboard {
             return;
         }
         let content = match content {
@@ -1264,9 +1401,7 @@ impl Engine {
         }
     }
 
-    fn peer_configured(&self) -> bool {
-        identity::parse(&self.config.peer_fingerprint).is_some() && !self.config.peer_address.trim().is_empty()
-    }
+    // ── Connections ─────────────────────────────────────────────────────
 
     fn save_and_publish(&mut self, message: &str) {
         match self.config.save() {
@@ -1276,58 +1411,99 @@ impl Engine {
         let _ = self.events.send(Event::Config(self.config.clone()));
     }
 
-    fn connect(&mut self) {
-        if self.session.is_some() || self.connecting {
+    fn connect_all(&mut self) {
+        for id in self.config.peers.keys().cloned().collect::<Vec<_>>() {
+            let link = self.links.entry(id.clone()).or_default();
+            link.user_disconnected = false;
+            link.delay = RECONNECT_MIN;
+            link.reconnect_at = None;
+            self.connect(&id);
+        }
+    }
+
+    fn connect(&mut self, id: &str) {
+        if self.sessions.contains_key(id) || self.links.get(id).is_some_and(|l| l.connecting) {
             return;
         }
         let Some(endpoint) = self.endpoint.clone() else {
             self.log("Networking is unavailable (see the error above).".into());
             return;
         };
-        let Some(fp) = identity::parse(&self.config.peer_fingerprint) else {
-            self.log("Pair with the other device first (Pairing page).".into());
-            return;
-        };
-        if self.config.peer_address.trim().is_empty() {
-            self.log("Pair with the other device first (Pairing page).".into());
+        let (Some(fp), Some(peer)) = (identity::parse(id), self.config.peers.get(id)) else { return };
+        let address = peer.address.trim().to_owned();
+        if address.is_empty() {
             return;
         }
         let client = match tls::client_config(&self.identity, Some(fp)) {
             Ok(c) => c,
             Err(e) => return self.log(format!("TLS setup failed: {e:#}")),
         };
-        let (tx, hello, address) = (self.internal.clone(), self.hello(), self.config.peer_address.trim().to_owned());
-        if self.reconnect_delay == RECONNECT_MIN {
-            self.log(format!("Connecting to {address}…"));
+        let link = self.links.entry(id.to_owned()).or_default();
+        if link.delay <= RECONNECT_MIN {
+            let name = if peer.name.is_empty() { address.clone() } else { peer.name.clone() };
+            self.log(format!("Connecting to {name}…"));
         }
-        self.connecting = true;
+        let link = self.links.entry(id.to_owned()).or_default();
+        link.connecting = true;
+        let _ = self.events.send(Event::Connecting { id: id.to_owned() });
+        let (tx, hello, id) = (self.internal.clone(), self.hello(), id.to_owned());
         tokio::spawn(async move {
-            let _ = tx.send(Internal::Established(connect(endpoint, client, address, hello).await));
+            let result = connect(endpoint, client, address, hello, fp).await;
+            let _ = tx.send(Internal::Dialed { id, result });
         });
     }
 
     /// Tries again later, backing off up to 30 s, with jitter so two devices
     /// that both dial don't keep colliding.
-    fn schedule_reconnect(&mut self) {
-        if self.user_disconnected || !self.config.connection.auto_reconnect || !self.peer_configured() {
+    fn schedule_reconnect(&mut self, id: &str) {
+        if !self.config.connection.auto_reconnect || !self.config.peers.contains_key(id) || self.sessions.contains_key(id) {
+            return;
+        }
+        let link = self.links.entry(id.to_owned()).or_default();
+        if link.user_disconnected {
             return;
         }
         let jitter = Duration::from_millis(
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_millis() as u64).unwrap_or(0) % 1000,
         );
-        let delay = self.reconnect_delay + jitter;
-        self.reconnect_at = Some(Instant::now() + delay);
-        self.reconnect_delay = (self.reconnect_delay * 2).min(RECONNECT_MAX);
-        let _ = self.events.send(Event::Reconnecting(delay.as_secs().max(1)));
+        link.delay = link.delay.max(RECONNECT_MIN);
+        let delay = link.delay + jitter;
+        link.reconnect_at = Some(Instant::now() + delay);
+        link.delay = (link.delay * 2).min(RECONNECT_MAX);
+        let _ = self.events.send(Event::Reconnecting { id: id.to_owned(), secs: delay.as_secs().max(1) });
+    }
+
+    fn next_reconnect(&self) -> Option<Instant> {
+        self.links.values().filter_map(|l| l.reconnect_at).min()
+    }
+
+    fn reconnect_due(&mut self) {
+        let now = Instant::now();
+        let due: Vec<DeviceId> = self
+            .links
+            .iter()
+            .filter(|(_, l)| l.reconnect_at.is_some_and(|at| at <= now))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in due {
+            if let Some(l) = self.links.get_mut(&id) {
+                l.reconnect_at = None;
+            }
+            self.connect(&id);
+        }
     }
 
     fn start_session(&mut self, est: Established) {
-        let Established { dialed, conn, mut send, mut recv, peer } = est;
-        self.connecting = false;
-        if let Some(existing) = &self.session {
+        let Established { dialed, fingerprint, conn, mut send, mut recv, peer } = est;
+        let device = identity::format(&fingerprint);
+        if !self.trusted.contains(&fingerprint) {
+            conn.close(2u32.into(), b"not paired");
+            return;
+        }
+        if let Some(existing) = self.sessions.get(&device) {
             // Both devices dialed at once. Each keeps the connection dialed by
             // the device with the lower fingerprint, so both keep the same one.
-            let we_are_lower = self.trusted.read().unwrap().is_none_or(|peer| self.identity.fingerprint < peer);
+            let we_are_lower = self.identity.fingerprint < fingerprint;
             let preferred = |by_us: bool| by_us == we_are_lower;
             if preferred(existing.dialed) || !preferred(dialed) {
                 conn.close(1u32.into(), b"busy");
@@ -1335,13 +1511,15 @@ impl Engine {
                 return;
             }
             tracing::debug!("replacing the connection to {} with the one both sides keep", peer.name);
-            self.end_session("replaced by a simultaneous connection".into());
+            self.end_session(&device, "replaced by a simultaneous connection".into());
         }
         let id = self.next_session;
         self.next_session += 1;
-        self.reconnect_at = None;
-        self.reconnect_delay = RECONNECT_MIN;
-        self.user_disconnected = false;
+        let link = self.links.entry(device.clone()).or_default();
+        link.reconnect_at = None;
+        link.delay = RECONNECT_MIN;
+        link.connecting = false;
+        link.user_disconnected = false;
 
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
         // Writer: keeps the engine loop from ever awaiting the network.
@@ -1366,7 +1544,7 @@ impl Engine {
             };
             let _ = tx.send(Internal::SessionClosed { session: id, reason });
         });
-        // Clipboard contents from the other device (one stream per copy).
+        // Clipboard contents from the device (one stream per copy).
         tokio::spawn(receive_clipboard(conn.clone(), id, self.internal.clone()));
         // Datagram reader (pointer motion).
         let (tx, c) = (self.internal.clone(), conn.clone());
@@ -1379,71 +1557,71 @@ impl Engine {
         });
 
         let _ = self.events.send(Event::Connected {
+            id: device.clone(),
             name: peer.name.clone(),
             os: peer.os,
             address: conn.remote_address(),
             screens: peer.displays.clone(),
         });
-        self.remember_peer(&peer.name, &peer.displays);
+        self.log(format!("Connected to {}.", peer.name));
+        self.remember_peer(&device, &peer);
         if peer.displays.is_empty() {
             self.log(format!("{} reported no screens, so the pointer can't move there yet.", peer.name));
         }
-        self.session = Some(Session { id, dialed, conn, out: out_tx, peer });
+        let out = out_tx.clone();
+        self.sessions.insert(device, Session { id, dialed, conn, out: out_tx, peer });
         // Whichever device was arranged last wins.
-        self.send_arrangement();
+        let _ = out.send(self.layout_message());
+        self.rebuild_world();
         self.sync_capture();
     }
 
-    fn remember_peer(&mut self, name: &str, screens: &[Rect]) {
-        // List the device for its own rules (all allowed until changed).
-        if let Some(fp) = identity::parse(&self.config.peer_fingerprint) {
-            let rules = self.config.devices.entry(identity::format(&fp)).or_default();
-            if rules.name != name {
-                rules.name = name.to_owned();
-                self.save_and_publish(&format!("{name} added to the device list."));
-            }
-        }
-        if self.config.last_peer_name.as_deref() != Some(name) || self.config.last_peer_screens != screens {
-            self.config.last_peer_name = Some(name.to_owned());
-            self.config.last_peer_screens = screens.to_vec();
+    /// Notes a device's name, OS and screens (to show it while it's offline).
+    fn remember_peer(&mut self, id: &str, hello: &Hello) {
+        let Some(entry) = self.config.peers.get_mut(id) else { return };
+        if entry.name != hello.name || entry.os != Some(hello.os) || entry.screens != hello.displays {
+            entry.name = hello.name.clone();
+            entry.os = Some(hello.os);
+            entry.screens = hello.displays.clone();
             if let Err(e) = self.config.save() {
                 self.log(format!("Cannot save settings: {e:#}"));
             }
+            let _ = self.events.send(Event::Config(self.config.clone()));
         }
     }
 
-    fn end_session(&mut self, reason: String) {
-        let Some(session) = self.session.take() else { return };
-        match self.mode {
-            Mode::Controlling => {
+    fn end_session(&mut self, id: &str, reason: String) {
+        let Some(session) = self.sessions.remove(id) else { return };
+        match &self.mode {
+            Mode::Controlling(t) if t == id => {
+                // Its screens are gone: bring the pointer home.
+                let p = self.home_point(self.pointer);
                 if let Some(c) = &self.capture {
-                    let ours = self.our_screens();
-                    let p = edge::return_point(self.config.link(), self.pointer.0, self.pointer.1, &ours, &session.peer.displays)
-                        .unwrap_or((0.0, 0.0));
                     c.release(p.0, p.1);
                 }
+                self.set_mode(Mode::Local);
             }
-            Mode::Controlled => {
+            Mode::Controlled(by) if by == id => {
                 if let Some(i) = &self.injector {
                     i.release_all();
                 }
+                self.set_mode(Mode::Local);
             }
-            Mode::Local => {}
+            _ => {}
         }
-        self.set_mode(Mode::Local);
-        self.sync_capture();
         session.conn.close(0u32.into(), b"bye");
-        let _ = self.events.send(Event::Disconnected { reason });
-        self.schedule_reconnect();
+        let _ = self.events.send(Event::Disconnected { id: id.to_owned(), reason });
+        self.rebuild_world();
+        self.sync_capture();
     }
 
     // ── Sending side ────────────────────────────────────────────────────
 
     fn captured(&mut self, event: CaptureEvent) {
-        // The other device drives our pointer, and it touched our edge before
+        // Another device drives our pointer, and it touched our edge before
         // capture was switched off: never take the pointer (it would stay
         // hidden). Hand it straight back.
-        if self.mode == Mode::Controlled
+        if matches!(self.mode, Mode::Controlled(_))
             && let CaptureEvent::Activated { x, y } = event
         {
             if let Some(c) = &self.capture {
@@ -1456,18 +1634,18 @@ impl Engine {
         }
         match event {
             CaptureEvent::Activated { x, y } => self.activated(x, y),
-            CaptureEvent::Input(input) if self.mode == Mode::Controlling => self.forward(input),
+            CaptureEvent::Input(input) if matches!(self.mode, Mode::Controlling(_)) => self.forward(input),
             CaptureEvent::Input(_) => {}
             CaptureEvent::Deactivated => {
-                if self.mode == Mode::Controlling {
-                    self.send(Message::Leave);
+                if let Mode::Controlling(t) = self.mode.clone() {
+                    self.send_to(&t, Message::Leave);
                     self.set_mode(Mode::Local);
                 }
             }
             CaptureEvent::Stopped { reason } => {
                 self.capture = None;
-                if self.mode == Mode::Controlling {
-                    self.send(Message::Leave);
+                if let Mode::Controlling(t) = self.mode.clone() {
+                    self.send_to(&t, Message::Leave);
                     self.set_mode(Mode::Local);
                 }
                 let _ = self.events.send(Event::CaptureReady(Err(reason)));
@@ -1475,56 +1653,65 @@ impl Engine {
         }
     }
 
-    fn activated(&mut self, x: f32, y: f32) {
-        let side = self.config.peer_side;
+    /// Gives the pointer straight back, just inside the edge it hit.
+    fn bounce(&self, side: Option<Side>, (x, y): (f32, f32)) {
         let ours = self.our_screens();
-        let in_corner = edge::in_dead_corner(side, x, y, &ours, self.config.switching.dead_corners as f32);
-        let entry = if in_corner || self.paused { None } else { edge::entry_point(self.config.link(), x, y, &ours, self.peer_screens()) };
-        match (entry, &self.session) {
-            (Some(p), Some(_)) if self.config.switching.delay_ms > 0 => {
-                // The compositor holds the pointer at the edge meanwhile.
-                self.pending_switch = Some(PendingSwitch {
-                    deadline: Instant::now() + Duration::from_millis(self.config.switching.delay_ms as u64),
-                    at: (x, y),
-                    entry: p,
-                    retreat: 0.0,
-                });
-            }
-            (Some(p), Some(_)) => self.enter_peer(p),
-            _ => {
-                // Nowhere to go: hand the pointer straight back.
-                let back = edge::inside_edge(side, x, y, &ours).unwrap_or((x, y));
-                if let Some(c) = &self.capture {
-                    c.release(back.0, back.1);
-                }
-            }
+        let back = side.and_then(|s| edge::inside_edge(s, x, y, &ours)).unwrap_or((x, y));
+        if let Some(c) = &self.capture {
+            c.release(back.0, back.1);
         }
     }
 
-    fn enter_peer(&mut self, p: (f32, f32)) {
-        self.pointer = p;
+    /// The pointer hit one of our edges at (x, y).
+    fn activated(&mut self, x: f32, y: f32) {
+        let ours = self.our_screens();
+        let side = world::side_at(&ours, (x, y), &self.sides);
+        if self.paused || !self.config.mouse.enabled {
+            return self.bounce(side, (x, y));
+        }
+        let Some(side) = side else { return self.bounce(None, (x, y)) };
+        if edge::in_dead_corner(side, x, y, &ours, self.config.switching.dead_corners as f32) {
+            return self.bounce(Some(side), (x, y));
+        }
+        let Some((target, entry)) = self.world.beyond(&self.me, (x, y), side).map(|(d, p)| (d.id.clone(), p)) else {
+            return self.bounce(Some(side), (x, y));
+        };
+        if !self.config.peer(&target).send.mouse {
+            return self.bounce(Some(side), (x, y));
+        }
+        if self.config.switching.delay_ms > 0 {
+            // The compositor holds the pointer at the edge meanwhile.
+            self.pending_switch = Some(PendingSwitch {
+                deadline: Instant::now() + Duration::from_millis(self.config.switching.delay_ms as u64),
+                at: (x, y),
+                side,
+                target,
+                entry,
+                retreat: 0.0,
+            });
+        } else {
+            self.enter(&target, entry);
+        }
+    }
+
+    /// The pointer moves onto `target` at its local point `at`.
+    fn enter(&mut self, target: &str, at: (f32, f32)) {
+        let Some(device) = self.world.device(target) else { return };
+        self.pointer = device.to_world(at);
         self.ctrl_down = false;
         self.alt_down = false;
-        self.send(Message::Enter { x: p.0, y: p.1 });
-        self.set_mode(Mode::Controlling);
+        self.send_to(target, Message::Enter { x: at.0, y: at.1 });
+        self.set_mode(Mode::Controlling(target.to_owned()));
     }
 
     /// The pointer kept pushing for the whole switch delay: go.
     fn commit_switch(&mut self) {
         if let Some(p) = self.pending_switch.take() {
-            if self.session.is_some() {
-                self.enter_peer(p.entry);
+            if self.sessions.contains_key(&p.target) {
+                self.enter(&p.target.clone(), p.entry);
             } else {
-                self.cancel_switch(p);
+                self.bounce(Some(p.side), p.at);
             }
-        }
-    }
-
-    fn cancel_switch(&mut self, p: PendingSwitch) {
-        let ours = self.our_screens();
-        let back = edge::inside_edge(self.config.peer_side, p.at.0, p.at.1, &ours).unwrap_or(p.at);
-        if let Some(c) = &self.capture {
-            c.release(back.0, back.1);
         }
     }
 
@@ -1534,7 +1721,7 @@ impl Engine {
         let Some(mut p) = self.pending_switch.take() else { return };
         match event {
             CaptureEvent::Input(Captured::Motion { dx, dy }) => {
-                let away = match self.config.peer_side {
+                let away = match p.side {
                     Side::Right => -dx,
                     Side::Left => dx,
                     Side::Bottom => -dy,
@@ -1542,12 +1729,12 @@ impl Engine {
                 };
                 p.retreat = (p.retreat + away).max(0.0);
                 if p.retreat > 6.0 {
-                    self.cancel_switch(p);
+                    self.bounce(Some(p.side), p.at);
                 } else {
                     self.pending_switch = Some(p);
                 }
             }
-            CaptureEvent::Input(_) => self.cancel_switch(p),
+            CaptureEvent::Input(_) => self.bounce(Some(p.side), p.at),
             CaptureEvent::Activated { .. } => self.pending_switch = Some(p),
             CaptureEvent::Deactivated => {}
             CaptureEvent::Stopped { reason } => {
@@ -1557,39 +1744,34 @@ impl Engine {
         }
     }
 
+    /// Where the pointer is on the controlled device, in its coordinates.
+    fn pointer_on(&self, target: &str) -> (f32, f32) {
+        self.world.device(target).map_or(self.pointer, |d| d.to_local(self.pointer))
+    }
+
     fn forward(&mut self, input: Captured) {
-        let (px, py) = self.pointer;
+        let Mode::Controlling(target) = self.mode.clone() else { return };
         match input {
-            Captured::Motion { dx, dy } => {
-                let speed = self.config.mouse.speed;
-                let (x, y) = (px + dx * speed, py + dy * speed);
-                // Only look up our screens once the pointer leaves the peer's.
-                let inside = Rect::bounds(self.peer_screens()).is_some_and(|b| b.contains(x, y));
-                if !inside && edge::crossed_back(self.config.link(), x, y, &self.our_screens(), self.peer_screens()) {
-                    self.leave_to_local(x, y);
-                } else {
-                    self.pointer = Rect::clamp_to_any(self.peer_screens(), x, y);
-                    self.send_motion(self.pointer.0, self.pointer.1);
-                }
-            }
+            Captured::Motion { dx, dy } => self.move_pointer(&target, dx, dy),
             Captured::Button { button, pressed } => {
                 let button = match (self.config.mouse.swap_buttons, button) {
                     (true, Button::Left) => Button::Right,
                     (true, Button::Right) => Button::Left,
                     (_, b) => b,
                 };
-                self.send(Message::Input(Input::Button { button, pressed, x: px, y: py }));
+                let (x, y) = self.pointer_on(&target);
+                self.send_to(&target, Message::Input(Input::Button { button, pressed, x, y }));
             }
             Captured::Scroll { dx, dy } => {
                 let k = self.scroll_factor();
-                self.send(Message::Input(Input::Scroll { dx: dx * k, dy: dy * k }));
+                self.send_to(&target, Message::Input(Input::Scroll { dx: dx * k, dy: dy * k }));
             }
             Captured::ScrollDiscrete { dx, dy } => {
                 let k = self.scroll_factor();
                 let scale = |v: i32| (v as f32 * k).round() as i32;
-                self.send(Message::Input(Input::ScrollDiscrete { dx: scale(dx), dy: scale(dy) }));
+                self.send_to(&target, Message::Input(Input::ScrollDiscrete { dx: scale(dx), dy: scale(dy) }));
             }
-            Captured::ScrollStop => self.send(Message::Input(Input::ScrollStop)),
+            Captured::ScrollStop => self.send_to(&target, Message::Input(Input::ScrollStop)),
             Captured::Key { key, pressed } => {
                 if key.is_ctrl() {
                     self.ctrl_down = pressed;
@@ -1605,18 +1787,47 @@ impl Engine {
                 };
                 if triggered {
                     if pressed {
-                        self.leave_to_local(px, py);
+                        self.leave_to_local(self.pointer);
                     }
                     return;
                 }
                 // Keyboard off for this device: keys go nowhere while the
                 // pointer is over there (the shortcut above still works).
-                if !(self.config.keyboard.enabled && self.config.peer_rules().send.keyboard) {
+                if !(self.config.keyboard.enabled && self.config.peer(&target).send.keyboard) {
                     return;
                 }
-                let peer_os = self.session.as_ref().map(|s| s.peer.os).unwrap_or(Os::Other);
+                let peer_os = self.sessions.get(&target).map(|s| s.peer.os).unwrap_or(Os::Other);
                 let key = self.config.keyboard.remap(key, Os::current(), peer_os);
-                self.send(Message::Input(Input::Key { key, pressed }));
+                self.send_to(&target, Message::Input(Input::Key { key, pressed }));
+            }
+        }
+    }
+
+    /// Moves the pointer through the shared space: on the device it's over,
+    /// onto the next device past an edge, or home.
+    fn move_pointer(&mut self, target: &str, dx: f32, dy: f32) {
+        let Some(current) = self.world.device(target) else { return };
+        // Motion is in our pixels; move the same number of pixels over there.
+        let k = self.config.mouse.speed * current.scale;
+        let to = (self.pointer.0 + dx * k, self.pointer.1 + dy * k);
+        let next = self.world.device_at(to).map(|d| d.id.clone());
+        match next {
+            Some(id) if id == target => {
+                self.pointer = to;
+                self.send_motion(target, self.pointer_on(target));
+            }
+            Some(id) if id == self.me => self.leave_to_local(to),
+            Some(id) if self.config.peer(&id).send.mouse && self.sessions.contains_key(&id) => {
+                // On to the next device.
+                self.send_to(target, Message::Leave);
+                let at = self.world.device(&id).map_or(to, |d| d.to_local(to));
+                self.enter(&id, at);
+                self.pointer = to;
+            }
+            _ => {
+                // Nothing there: the edge is a wall.
+                self.pointer = current.clamp(to);
+                self.send_motion(target, self.pointer_on(target));
             }
         }
     }
@@ -1626,10 +1837,20 @@ impl Engine {
         if m.natural_scroll { -m.scroll_speed } else { m.scroll_speed }
     }
 
-    fn leave_to_local(&mut self, x: f32, y: f32) {
-        self.send(Message::Leave);
-        let ours = self.our_screens();
-        let back = edge::return_point(self.config.link(), x, y, &ours, self.peer_screens()).unwrap_or((0.0, 0.0));
+    /// Our nearest point to `world_point`, a little inside our edges so the
+    /// pointer doesn't land on one and switch straight back.
+    fn home_point(&self, world_point: (f32, f32)) -> (f32, f32) {
+        let Some(me) = self.world.device(&self.me) else { return (0.0, 0.0) };
+        let (x, y) = me.to_local(me.clamp(world_point));
+        let b = me.bounds;
+        (x.clamp(b.x as f32 + 2.0, b.right() - 3.0), y.clamp(b.y as f32 + 2.0, b.bottom() - 3.0))
+    }
+
+    fn leave_to_local(&mut self, world_point: (f32, f32)) {
+        if let Mode::Controlling(t) = self.mode.clone() {
+            self.send_to(&t, Message::Leave);
+        }
+        let back = self.home_point(world_point);
         if let Some(c) = &self.capture {
             c.release(back.0, back.1);
         }
@@ -1638,80 +1859,82 @@ impl Engine {
 
     // ── Receiving side ──────────────────────────────────────────────────
 
-    fn inbound(&mut self, message: Message) {
+    fn inbound(&mut self, from: &str, message: Message) {
         match message {
             Message::Enter { x, y } => {
-                if !self.config.connection.allow_control || !self.config.peer_rules().receive.mouse {
+                let name = self.peer_name(from);
+                if !self.config.connection.allow_control || !self.config.peer(from).receive.mouse {
                     // Hand control straight back.
-                    self.send(Message::Leave);
-                    self.log("The other device tried to take control, but its mouse isn't allowed here.".into());
+                    self.send_to(from, Message::Leave);
+                    self.log(format!("{name} tried to take control, but its mouse isn't allowed here."));
                     return;
                 }
-                if self.mode == Mode::Controlling {
-                    // Both sides crossed at once: yield to the peer.
-                    let (px, py) = self.pointer;
-                    self.leave_to_local(px, py);
+                match self.mode.clone() {
+                    Mode::Controlled(by) if by != from => {
+                        // Someone else is already in control.
+                        self.send_to(from, Message::Leave);
+                        return;
+                    }
+                    // Both crossed at once: yield.
+                    Mode::Controlling(_) => self.leave_to_local(self.pointer),
+                    _ => {}
                 }
-                self.set_mode(Mode::Controlled);
+                self.set_mode(Mode::Controlled(from.to_owned()));
                 self.sync_capture();
                 if let Some(i) = &self.injector {
                     i.inject(Input::Motion { x, y });
                 } else {
-                    self.log("The peer is trying to control this device, but remote input wasn't allowed here.".into());
+                    self.log(format!("{name} is trying to control this device, but remote input wasn't allowed here."));
                 }
             }
             Message::Input(input) => {
-                if matches!(input, Input::Key { .. }) && !self.config.peer_rules().receive.keyboard {
+                if self.mode != Mode::Controlled(from.to_owned()) {
+                    return;
+                }
+                if matches!(input, Input::Key { .. }) && !self.config.peer(from).receive.keyboard {
                     return; // its keyboard isn't allowed here
                 }
-                if self.mode == Mode::Controlled
-                    && let Some(i) = &self.injector
-                {
+                if let Some(i) = &self.injector {
                     i.inject(input);
                 }
             }
-            Message::Leave => {
-                if self.mode == Mode::Controlling {
-                    // The peer handed control back (it refused it, or its
+            Message::Leave => match self.mode.clone() {
+                Mode::Controlling(t) if t == from => {
+                    // The device handed control back (it refused it, or its
                     // user pressed its own return shortcut).
-                    let ours = self.our_screens();
-                    let (x, y) = self.pointer;
-                    let back = edge::return_point(self.config.link(), x, y, &ours, self.peer_screens()).unwrap_or((0.0, 0.0));
+                    let back = self.home_point(self.pointer);
                     if let Some(c) = &self.capture {
                         c.release(back.0, back.1);
                     }
                     self.set_mode(Mode::Local);
-                    return;
                 }
-                if let Some(i) = &self.injector {
-                    i.release_all();
-                }
-                if self.mode == Mode::Controlled {
+                Mode::Controlled(by) if by == from => {
+                    if let Some(i) = &self.injector {
+                        i.release_all();
+                    }
                     self.set_mode(Mode::Local);
                     self.sync_capture();
                 }
-            }
+                _ => {}
+            },
             Message::ReleaseAll => {
-                if let Some(i) = &self.injector {
+                if self.mode == Mode::Controlled(from.to_owned())
+                    && let Some(i) = &self.injector
+                {
                     i.release_all();
                 }
             }
             Message::Displays(displays) => {
-                let name = match &mut self.session {
-                    Some(s) => {
-                        s.peer.displays = displays.clone();
-                        s.peer.name.clone()
-                    }
-                    None => return,
-                };
-                let _ = self.events.send(Event::PeerScreens(displays.clone()));
-                self.remember_peer(&name, &displays);
+                let Some(s) = self.sessions.get_mut(from) else { return };
+                s.peer.displays = displays.clone();
+                let hello = s.peer.clone();
+                let _ = self.events.send(Event::PeerScreens { id: from.to_owned(), screens: displays });
+                self.remember_peer(from, &hello);
+                self.rebuild_world();
             }
+            Message::Layout { proportional, origins, row, changed_at } => self.peer_layout(from, proportional, origins, row, changed_at),
             // Only valid before a session starts.
             Message::Hello(_) | Message::PairRequest { .. } | Message::PairAccept | Message::PairReject => {}
-            Message::Arrangement { side, offset, proportional, changed_at } => {
-                self.peer_arranged(Link { side, offset, proportional }, changed_at)
-            }
         }
     }
 }
@@ -1739,9 +1962,9 @@ mod tests {
         let client_ep = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0)))?;
         let accept_task = {
             let server = server.clone();
-            tokio::spawn(async move { accept(server.accept().await.unwrap(), hello("A"), Some(a_trusts)).await })
+            tokio::spawn(async move { accept(server.accept().await.unwrap(), hello("A"), &HashSet::from([a_trusts])).await })
         };
-        let dial = connect(client_ep, tls::client_config(b, Some(a.fingerprint))?, format!("127.0.0.1:{port}"), hello("B")).await;
+        let dial = connect(client_ep, tls::client_config(b, Some(a.fingerprint))?, format!("127.0.0.1:{port}"), hello("B"), a.fingerprint).await;
         let accepted = match accept_task.await?? {
             Accepted::Session(est) => est,
             Accepted::Pair(_) => anyhow::bail!("expected a session"),
@@ -1756,7 +1979,7 @@ mod tests {
         let server = bind(&a, 0).unwrap();
         let port = server.local_addr().unwrap().port();
         let client_ep = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
-        let accept_task = tokio::spawn(async move { accept(server.accept().await.unwrap(), hello("A"), None).await });
+        let accept_task = tokio::spawn(async move { accept(server.accept().await.unwrap(), hello("A"), &HashSet::new()).await });
         let at_b = dial_pair(client_ep, tls::client_config(&b, None).unwrap(), format!("127.0.0.1:{port}"), "B".into()).await.unwrap();
         let Accepted::Pair(at_a) = accept_task.await.unwrap().unwrap() else { panic!("expected a pairing request") };
         assert_eq!((at_a.name.as_str(), at_b.name.as_str()), ("B", "A"));

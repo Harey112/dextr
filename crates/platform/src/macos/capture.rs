@@ -35,9 +35,9 @@ struct State {
     /// Cleared on release until the cursor leaves the edge, so pushing on
     /// after being handed back doesn't re-trigger at every event.
     armed: bool,
-    side: Side,
-    /// Our screens whose `side` edge is on the outside of the layout.
-    edges: Vec<Rect>,
+    sides: Vec<Side>,
+    /// Our screens' outer edges that have another device past them.
+    edges: Vec<(Side, Rect)>,
     cursor_hidden: bool,
     /// Keys held on this Mac (macOS keycodes). If one is still held when
     /// the pointer crosses, its release must reach this Mac, not the peer,
@@ -46,32 +46,25 @@ struct State {
 }
 
 impl State {
-    fn set_layout(&mut self, side: Side, screens: &[Rect]) {
-        self.side = side;
-        self.edges = Rect::on_outer_edge(screens, side);
+    fn set_layout(&mut self, sides: &[Side], screens: &[Rect]) {
+        self.sides = sides.to_vec();
+        self.edges = sides.iter().flat_map(|&side| Rect::on_outer_edge(screens, side).into_iter().map(move |r| (side, r))).collect();
     }
 
-    /// Whether the cursor at `p`, moving by (dx, dy), is pushing against the
-    /// edge facing the peer.
+    /// Whether the cursor at `p`, moving by (dx, dy), is pushing against an
+    /// edge with another device past it.
     fn pushing_edge(&self, p: CGPoint, dx: f64, dy: f64) -> bool {
         let (x, y) = (p.x as f32, p.y as f32);
-        let outward = match self.side {
-            Side::Right => dx > 0.0,
-            Side::Left => dx < 0.0,
-            Side::Bottom => dy > 0.0,
-            Side::Top => dy < 0.0,
-        };
-        outward
-            && self.edges.iter().any(|r| {
-                let along_y = y >= r.y as f32 && y < r.bottom();
-                let along_x = x >= r.x as f32 && x < r.right();
-                match self.side {
-                    Side::Right => along_y && x >= r.right() - 1.0,
-                    Side::Left => along_y && x < r.x as f32 + 1.0,
-                    Side::Bottom => along_x && y >= r.bottom() - 1.0,
-                    Side::Top => along_x && y < r.y as f32 + 1.0,
-                }
-            })
+        self.edges.iter().any(|(side, r)| {
+            let along_y = y >= r.y as f32 && y < r.bottom();
+            let along_x = x >= r.x as f32 && x < r.right();
+            match side {
+                Side::Right => dx > 0.0 && along_y && x >= r.right() - 1.0,
+                Side::Left => dx < 0.0 && along_y && x < r.x as f32 + 1.0,
+                Side::Bottom => dy > 0.0 && along_x && y >= r.bottom() - 1.0,
+                Side::Top => dy < 0.0 && along_x && y < r.y as f32 + 1.0,
+            }
+        })
     }
 
     fn grab(&mut self) {
@@ -125,7 +118,7 @@ const EVENTS: u64 = bit(LEFT_DOWN)
     | bit(OTHER_DRAGGED);
 
 pub(crate) fn spawn_capture(
-    side: Side,
+    sides: Vec<Side>,
     mut commands: mpsc::UnboundedReceiver<CaptureCommand>,
     events: mpsc::UnboundedSender<CaptureEvent>,
     screens_tx: watch::Sender<Vec<Rect>>,
@@ -133,8 +126,8 @@ pub(crate) fn spawn_capture(
 ) -> anyhow::Result<()> {
     let mut known = screens();
     screens_tx.send_replace(known.clone());
-    let mut state = State { enabled: false, captured: false, armed: true, side, edges: Vec::new(), cursor_hidden: false, held: Vec::new() };
-    state.set_layout(side, &known);
+    let mut state = State { enabled: false, captured: false, armed: true, sides: Vec::new(), edges: Vec::new(), cursor_hidden: false, held: Vec::new() };
+    state.set_layout(&sides, &known);
     let shared = Arc::new(Shared {
         events,
         state: Mutex::new(state),
@@ -174,7 +167,7 @@ pub(crate) fn spawn_capture(
                             st.enabled = false;
                         }
                         CaptureCommand::Release { x, y } => st.release(Some((x, y))),
-                        CaptureCommand::SetSide(side) => st.set_layout(side, &known),
+                        CaptureCommand::SetSides(sides) => st.set_layout(&sides, &known),
                     }
                 }
                 _ = poll.tick() => {
@@ -182,8 +175,8 @@ pub(crate) fn spawn_capture(
                     if now != known {
                         known = now;
                         let mut st = shared.state.lock().unwrap();
-                        let side = st.side;
-                        st.set_layout(side, &known);
+                        let sides = st.sides.clone();
+                        st.set_layout(&sides, &known);
                         screens_tx.send_replace(known.clone());
                     }
                 }

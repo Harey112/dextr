@@ -9,17 +9,17 @@ mod icon;
 mod pages;
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{Mutex, OnceLock},
 };
 
 use dextr_core::{
     Command, Config, Event, LocalAddress, Mode, Nearby, PairingState,
-    edge::Link,
     settings::{Appearance, Channel, DisplayLayout, ModifierMap, ReturnShortcut},
+    world::{Arrangement, DeviceId},
 };
 use dextr_platform::tray::{TrayAction, TrayHandle, TrayState};
-use dextr_proto::{Os, Rect, Side};
+use dextr_proto::{Os, Rect};
 use iced::{
     Font, Subscription, Task, Theme,
     futures::{SinkExt, Stream},
@@ -133,6 +133,7 @@ pub enum Access {
     Denied(String),
 }
 
+/// A connected device.
 pub struct Peer {
     pub name: String,
     pub os: Os,
@@ -141,9 +142,9 @@ pub struct Peer {
 }
 
 /// Actions that need a second click to confirm.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Danger {
-    ForgetPeer,
+    ForgetPeer(DeviceId),
     NewFingerprint,
     ResetSettings,
 }
@@ -161,9 +162,12 @@ pub struct App {
     pub listening: Option<u16>,
     pub capture: Access,
     pub inject: Access,
-    pub peer: Option<Peer>,
-    pub connecting: bool,
-    pub reconnect_in: Option<u64>,
+    /// Connected devices.
+    pub peers: BTreeMap<DeviceId, Peer>,
+    /// Devices being dialed.
+    pub connecting: BTreeSet<DeviceId>,
+    /// Devices waiting to reconnect, with seconds to go.
+    pub reconnect_in: BTreeMap<DeviceId, u64>,
     pub mode: Option<Mode>,
     pub paused: bool,
     pub local_screens: Vec<Rect>,
@@ -191,42 +195,27 @@ pub struct App {
 pub struct Form {
     pub name: String,
     pub port: String,
-    pub address: String,
-    pub fingerprint: String,
     /// Everything else, edited in place.
     pub config: Config,
 }
 
 impl Form {
     fn from_config(c: &Config) -> Self {
-        Self {
-            name: c.device_name.clone(),
-            port: c.port.to_string(),
-            address: c.peer_address.clone(),
-            fingerprint: c.peer_fingerprint.clone(),
-            config: c.clone(),
-        }
+        Self { name: c.device_name.clone(), port: c.port.to_string(), config: c.clone() }
     }
 
     fn to_config(&self, base: &Config) -> Result<Config, String> {
         let Some(port) = self.port.trim().parse::<u16>().ok().filter(|p| *p > 0) else {
             return Err("Port must be a number from 1 to 65535.".into());
         };
-        if !self.fingerprint.trim().is_empty() && dextr_core::identity::parse(&self.fingerprint).is_none() {
-            return Err("That fingerprint isn't valid. It should be 64 letters and digits (0–9, A–F).".into());
-        }
         if self.name.trim().is_empty() {
             return Err("Give this device a name.".into());
         }
         Ok(Config {
             device_name: self.name.trim().to_owned(),
             port,
-            peer_address: self.address.trim().to_owned(),
-            peer_fingerprint: self.fingerprint.trim().to_owned(),
             // Owned by the engine.
             inject_restore_token: base.inject_restore_token.clone(),
-            last_peer_name: base.last_peer_name.clone(),
-            last_peer_screens: base.last_peer_screens.clone(),
             ..self.config.clone()
         })
     }
@@ -235,7 +224,7 @@ impl Form {
 /// One setting changed in the UI.
 #[derive(Debug, Clone)]
 pub enum Setting {
-    Arrange(Link),
+    Arrange(Arrangement),
     Layout(DisplayLayout),
     MouseEnabled(bool),
     KeyboardEnabled(bool),
@@ -274,22 +263,14 @@ impl Setting {
 
     fn apply(self, c: &mut Config) {
         match self {
-            Setting::Arrange(l) => {
-                c.peer_side = l.side;
-                c.peer_offset = l.offset;
-            }
-            Setting::Layout(layout) => {
-                c.layout = layout;
-                // Proportional is a horizontal row: other device left or right.
-                if layout == DisplayLayout::Proportional && !c.peer_side.is_horizontal() {
-                    c.peer_side = Side::Right;
-                }
-            }
+            Setting::Arrange(a) => c.arrangement = a,
+            Setting::Layout(layout) => c.layout = layout,
             Setting::MouseEnabled(v) => c.mouse.enabled = v,
             Setting::KeyboardEnabled(v) => c.keyboard.enabled = v,
             Setting::Rule { device, outgoing, channel, on } => {
-                let rules = c.devices.entry(device).or_default();
-                if outgoing { rules.send.set(channel, on) } else { rules.receive.set(channel, on) }
+                if let Some(rules) = c.peers.get_mut(&device) {
+                    if outgoing { rules.send.set(channel, on) } else { rules.receive.set(channel, on) }
+                }
             }
             Setting::DeadCorners(v) => c.switching.dead_corners = v,
             Setting::SwitchDelay(v) => c.switching.delay_ms = v,
@@ -329,8 +310,9 @@ pub enum Message {
     Copy(String),
     Set(Setting),
     Save,
-    Connect,
-    Disconnect,
+    /// Connect to one device, or all (`None`).
+    Connect(Option<DeviceId>),
+    Disconnect(Option<DeviceId>),
     Paused(bool),
     RetryPermissions,
     CopyFingerprint,
@@ -375,15 +357,28 @@ impl App {
 
     /// One line for the tray: who we're connected to and what's happening.
     fn status_line(&self) -> String {
-        match (&self.peer, self.mode) {
-            (Some(p), Some(Mode::Controlling)) => format!("Controlling {}", p.name),
-            (Some(p), Some(Mode::Controlled)) => format!("{} is controlling this device", p.name),
-            (Some(p), _) if self.paused => format!("Connected to {} · paused", p.name),
-            (Some(p), _) => format!("Connected to {}", p.name),
-            (None, _) if self.connecting => "Connecting…".into(),
-            (None, _) if self.reconnect_in.is_some() => "Reconnecting…".into(),
-            (None, _) => "Not connected".into(),
+        match &self.mode {
+            Some(Mode::Controlling(id)) => format!("Controlling {}", self.device_name(id)),
+            Some(Mode::Controlled(id)) => format!("{} is controlling this device", self.device_name(id)),
+            _ if self.peers.is_empty() && !self.connecting.is_empty() => "Connecting…".into(),
+            _ if self.peers.is_empty() && !self.reconnect_in.is_empty() => "Reconnecting…".into(),
+            _ if self.peers.is_empty() => "Not connected".into(),
+            _ => {
+                let names: Vec<&str> = self.peers.values().map(|p| p.name.as_str()).collect();
+                let line = format!("Connected to {}", names.join(", "));
+                if self.paused { format!("{line} · paused") } else { line }
+            }
         }
+    }
+
+    /// A device's name, connected or not.
+    pub fn device_name(&self, id: &str) -> String {
+        self.peers
+            .get(id)
+            .map(|p| p.name.clone())
+            .or_else(|| self.config().peers.get(id).map(|p| p.name.clone()))
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "Paired device".into())
     }
 
     /// Starts the tray icon (main thread, event loop running) or updates it.
@@ -407,9 +402,9 @@ impl App {
     }
 
     fn title(&self, _window: window::Id) -> String {
-        match (&self.peer, self.mode) {
-            (Some(p), Some(Mode::Controlling)) => format!("dextr — controlling {}", p.name),
-            (Some(p), _) => format!("dextr — connected to {}", p.name),
+        match &self.mode {
+            Some(Mode::Controlling(id)) => format!("dextr — controlling {}", self.device_name(id)),
+            _ if !self.peers.is_empty() => format!("dextr — {}", self.status_line().to_lowercase()),
             _ => "dextr".into(),
         }
     }
@@ -457,7 +452,7 @@ impl App {
         match self.form.to_config(base) {
             Ok(config) => {
                 if &config != base {
-                    self.send(Command::Apply(config.clone()));
+                    self.send(Command::Apply(Box::new(config.clone())));
                     self.saved = Some(config);
                 }
                 true
@@ -474,23 +469,22 @@ impl App {
         &self.form.config
     }
 
-    /// The connected peer's screens, if it has reported any.
-    pub fn peer_screens(&self) -> Option<&[Rect]> {
-        self.peer.as_ref().map(|p| p.screens.as_slice()).filter(|s| !s.is_empty())
+    /// Every paired device's screens (live if connected, else as last seen),
+    /// and this device's, for the arrangement.
+    pub fn all_screens(&self) -> BTreeMap<DeviceId, Vec<Rect>> {
+        let mut out: BTreeMap<DeviceId, Vec<Rect>> = self
+            .config()
+            .peers
+            .iter()
+            .map(|(id, p)| (id.clone(), self.peers.get(id).map_or_else(|| p.screens.clone(), |c| c.screens.clone())))
+            .collect();
+        out.insert(self.fingerprint.clone(), self.local_screens.clone());
+        out
     }
 
-    pub fn peer_name(&self) -> String {
-        if let Some(p) = &self.peer {
-            return p.name.clone();
-        }
-        self.saved
-            .as_ref()
-            .and_then(|c| c.last_peer_name.clone())
-            .unwrap_or_else(|| "Other device".into())
-    }
-
-    pub fn peer_os(&self) -> Option<Os> {
-        self.peer.as_ref().map(|p| p.os)
+    /// The OS of a connected device.
+    pub fn peer_os(&self, id: &str) -> Option<Os> {
+        self.peers.get(id).map(|p| p.os).or_else(|| self.config().peers.get(id).and_then(|p| p.os))
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -577,15 +571,15 @@ impl App {
                     self.notice = None;
                 }
             }
-            Message::Connect => {
-                if self.save() {
-                    self.connecting = true;
-                    self.send(Command::Connect);
+            Message::Connect(id) => self.send(Command::Connect(id)),
+            Message::Disconnect(id) => {
+                match &id {
+                    Some(id) => {
+                        self.reconnect_in.remove(id);
+                    }
+                    None => self.reconnect_in.clear(),
                 }
-            }
-            Message::Disconnect => {
-                self.reconnect_in = None;
-                self.send(Command::Disconnect);
+                self.send(Command::Disconnect(id));
             }
             Message::Paused(paused) => {
                 self.paused = paused;
@@ -632,7 +626,7 @@ impl App {
             Message::Confirm(danger) => {
                 self.confirm = None;
                 match danger {
-                    Danger::ForgetPeer => self.send(Command::ForgetPeer),
+                    Danger::ForgetPeer(id) => self.send(Command::ForgetPeer(id)),
                     Danger::ResetSettings => self.send(Command::ResetSettings),
                     Danger::NewFingerprint => self.new_fingerprint(),
                 }
@@ -689,32 +683,32 @@ impl App {
                     }
                 }
             }
-            Event::Connected { name, os, address, screens } => {
-                self.connecting = false;
-                self.reconnect_in = None;
+            Event::Connected { id, name, os, address, screens } => {
+                self.connecting.remove(&id);
+                self.reconnect_in.remove(&id);
                 self.notice = None;
-                self.push_log(format!("Connected to {name}."));
-                if let Some(saved) = &mut self.saved {
-                    saved.last_peer_name = Some(name.clone());
-                    saved.last_peer_screens = screens.clone();
+                self.peers.insert(id, Peer { name, os, address: address.ip().to_canonical().to_string(), screens });
+            }
+            Event::Disconnected { id, reason } => {
+                self.connecting.remove(&id);
+                if let Some(p) = self.peers.remove(&id) {
+                    self.push_log(format!("Disconnected from {}: {reason}", p.name));
                 }
-                self.peer = Some(Peer { name, os, address: address.ip().to_string(), screens });
             }
-            Event::Disconnected { reason } => {
-                self.connecting = false;
-                self.push_log(format!("Disconnected: {reason}"));
-                self.peer = None;
+            Event::Connecting { id } => {
+                self.connecting.insert(id);
             }
-            Event::Reconnecting(secs) => {
-                self.connecting = false;
-                self.reconnect_in = (secs > 0).then_some(secs);
+            Event::Reconnecting { id, secs } => {
+                self.connecting.remove(&id);
+                if secs > 0 {
+                    self.reconnect_in.insert(id, secs);
+                } else {
+                    self.reconnect_in.remove(&id);
+                }
             }
             Event::LocalScreens(screens) => self.local_screens = screens,
-            Event::PeerScreens(screens) => {
-                if let Some(saved) = &mut self.saved {
-                    saved.last_peer_screens = screens.clone();
-                }
-                if let Some(p) = &mut self.peer {
+            Event::PeerScreens { id, screens } => {
+                if let Some(p) = self.peers.get_mut(&id) {
                     p.screens = screens;
                 }
             }
@@ -734,18 +728,7 @@ impl App {
             Event::PairingFailed(reason) => self.pairing_error = Some(reason),
             Event::Nearby(list) => self.nearby = list,
             Event::Addresses(list) => self.addresses = list,
-            Event::Log(line) => {
-                if line.starts_with("Connection failed") {
-                    self.connecting = false;
-                    if self.reconnect_in.is_none() {
-                        self.notify(line);
-                    } else {
-                        self.push_log(line);
-                    }
-                } else {
-                    self.push_log(line);
-                }
-            }
+            Event::Log(line) => self.push_log(line),
         }
         Task::none()
     }

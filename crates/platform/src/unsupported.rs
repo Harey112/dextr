@@ -11,7 +11,7 @@ fn unsupported() -> anyhow::Error {
 }
 
 pub(crate) fn spawn_capture(
-    _side: Side,
+    _sides: Vec<Side>,
     _commands: mpsc::UnboundedReceiver<CaptureCommand>,
     _events: mpsc::UnboundedSender<CaptureEvent>,
     _screens: watch::Sender<Vec<Rect>>,

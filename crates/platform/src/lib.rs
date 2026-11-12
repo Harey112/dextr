@@ -62,7 +62,7 @@ pub(crate) enum CaptureCommand {
     Enable,
     Disable,
     Release { x: f32, y: f32 },
-    SetSide(Side),
+    SetSides(Vec<Side>),
 }
 
 /// Controls the local input capture. Dropping it ends the capture session.
@@ -89,8 +89,9 @@ impl CaptureHandle {
         let _ = self.commands.send(CaptureCommand::Release { x, y });
     }
 
-    pub fn set_side(&self, side: Side) {
-        let _ = self.commands.send(CaptureCommand::SetSide(side));
+    /// Watch these edges (the sides with another device past them).
+    pub fn set_sides(&self, sides: Vec<Side>) {
+        let _ = self.commands.send(CaptureCommand::SetSides(sides));
     }
 
     /// The local screens as the capture backend sees them.
@@ -102,13 +103,13 @@ impl CaptureHandle {
 /// Starts capture with the peer on `side`. Resolves once the OS has granted
 /// access (this may show a permission dialog).
 pub async fn start_capture(
-    side: Side,
+    sides: Vec<Side>,
 ) -> anyhow::Result<(CaptureHandle, mpsc::UnboundedReceiver<CaptureEvent>)> {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let (screens_tx, screens_rx) = watch::channel(Vec::new());
     let (ready_tx, ready_rx) = oneshot::channel();
-    native::spawn_capture(side, cmd_rx, event_tx, screens_tx, ready_tx)?;
+    native::spawn_capture(sides, cmd_rx, event_tx, screens_tx, ready_tx)?;
     ready_rx.await??;
     Ok((
         CaptureHandle { commands: cmd_tx, screens: screens_rx },

@@ -1,49 +1,80 @@
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use anyhow::Context as _;
-use dextr_proto::{DEFAULT_PORT, Rect, Side};
+use dextr_proto::{DEFAULT_PORT, Os, Rect, Side};
 use serde::{Deserialize, Serialize};
 
-use crate::settings::{
-    Appearance, ClipboardSettings, ConnectionSettings, DeviceRules, DisplayLayout, KeyboardSettings, MouseSettings, SwitchingSettings,
+use crate::{
+    settings::{
+        Appearance, ClipboardSettings, ConnectionSettings, DeviceRules, Direction, DisplayLayout, KeyboardSettings, MouseSettings,
+        SwitchingSettings,
+    },
+    world::{Arrangement, DeviceId},
 };
+
+/// A paired device.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(default)]
+pub struct PeerEntry {
+    /// Its name, as last seen.
+    pub name: String,
+    /// Where to reach it: `host` or `host:port`.
+    pub address: String,
+    pub os: Option<Os>,
+    /// Its screens from the last connection, so the arrangement can show it
+    /// while it's offline.
+    pub screens: Vec<Rect>,
+    /// What goes from this device to it.
+    pub send: Direction,
+    /// What comes from it to this device.
+    pub receive: Direction,
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct Config {
-    /// Shown to the peer.
+    /// Shown to other devices.
     pub device_name: String,
     /// UDP port this device listens on.
     pub port: u16,
-    /// Peer address as `host` or `host:port`.
-    pub peer_address: String,
-    /// The peer's certificate fingerprint (SHA-256). Only this peer may
-    /// connect, and we only connect to it.
-    pub peer_fingerprint: String,
-    /// Where the peer sits relative to this device.
-    pub peer_side: Side,
-    /// Position of the peer's screens along that side, in pixels from the
-    /// start of our edge. `None` centers them.
-    pub peer_offset: Option<i32>,
+    /// Paired devices, by certificate fingerprint. Only they may connect,
+    /// and we only connect to them.
+    pub peers: BTreeMap<DeviceId, PeerEntry>,
     /// Exact or proportional edges.
     pub layout: DisplayLayout,
-    /// When the arrangement last changed (Unix ms), so the two devices can
-    /// keep the newest one.
-    pub arranged_at: u64,
+    /// Where every device's screens sit (shared by all devices).
+    pub arrangement: Arrangement,
+    /// Where a newly paired device goes until it's arranged.
+    pub new_device_side: Side,
     /// Saved RemoteDesktop portal grant, so the permission dialog is shown once.
     pub inject_restore_token: Option<String>,
-    /// The peer's name and screens from the last connection, so the display
-    /// arrangement can be shown while it's offline.
-    pub last_peer_name: Option<String>,
-    pub last_peer_screens: Vec<Rect>,
     pub connection: ConnectionSettings,
     pub switching: SwitchingSettings,
     pub mouse: MouseSettings,
     pub keyboard: KeyboardSettings,
     pub clipboard: ClipboardSettings,
-    /// What may go to and come from each paired device, by fingerprint.
-    pub devices: std::collections::BTreeMap<String, DeviceRules>,
     pub appearance: Appearance,
+
+    // Single-peer settings from earlier versions, read once and moved into
+    // `peers` and `arrangement`.
+    #[serde(skip_serializing)]
+    #[doc(hidden)]
+    pub peer_address: String,
+    #[serde(skip_serializing)]
+    #[doc(hidden)]
+    pub peer_fingerprint: String,
+    #[serde(skip_serializing)]
+    #[doc(hidden)]
+    pub peer_side: Option<Side>,
+    #[serde(skip_serializing)]
+    #[doc(hidden)]
+    pub last_peer_name: Option<String>,
+    #[serde(skip_serializing)]
+    #[doc(hidden)]
+    pub last_peer_screens: Vec<Rect>,
+    #[serde(skip_serializing)]
+    #[doc(hidden)]
+    pub devices: BTreeMap<String, DeviceRules>,
 }
 
 impl Default for Config {
@@ -51,22 +82,23 @@ impl Default for Config {
         Self {
             device_name: hostname(),
             port: DEFAULT_PORT,
-            peer_address: String::new(),
-            peer_fingerprint: String::new(),
-            peer_side: Side::Right,
-            peer_offset: None,
+            peers: BTreeMap::new(),
             layout: DisplayLayout::Exact,
-            arranged_at: 0,
+            arrangement: Arrangement::default(),
+            new_device_side: Side::Right,
             inject_restore_token: None,
-            last_peer_name: None,
-            last_peer_screens: Vec::new(),
             connection: ConnectionSettings::default(),
             switching: SwitchingSettings::default(),
             mouse: MouseSettings::default(),
             keyboard: KeyboardSettings::default(),
             clipboard: ClipboardSettings::default(),
-            devices: Default::default(),
             appearance: Appearance::default(),
+            peer_address: String::new(),
+            peer_fingerprint: String::new(),
+            peer_side: None,
+            last_peer_name: None,
+            last_peer_screens: Vec::new(),
+            devices: BTreeMap::new(),
         }
     }
 }
@@ -101,20 +133,28 @@ pub fn dir() -> anyhow::Result<PathBuf> {
 }
 
 impl Config {
-    /// The rules for the paired device (all allowed until changed).
-    pub fn peer_rules(&self) -> DeviceRules {
-        crate::identity::parse(&self.peer_fingerprint)
-            .and_then(|fp| self.devices.get(&crate::identity::format(&fp)).cloned())
-            .unwrap_or_default()
+    /// The rules for a paired device (all allowed until changed).
+    pub fn peer(&self, id: &str) -> PeerEntry {
+        self.peers.get(id).cloned().unwrap_or_default()
     }
 
-    /// How the peer's screens sit against ours.
-    pub fn link(&self) -> crate::edge::Link {
-        crate::edge::Link {
-            side: self.peer_side,
-            offset: self.peer_offset,
-            proportional: self.layout == DisplayLayout::Proportional,
+    /// Moves settings from the single-peer versions into `peers`.
+    fn migrate(&mut self) {
+        if let Some(side) = self.peer_side.take() {
+            self.new_device_side = side;
         }
+        let Some(fp) = crate::identity::parse(&std::mem::take(&mut self.peer_fingerprint)) else { return };
+        let id = crate::identity::format(&fp);
+        let rules = self.devices.remove(&id).unwrap_or_default();
+        self.peers.entry(id).or_insert_with(|| PeerEntry {
+            name: self.last_peer_name.take().unwrap_or_default(),
+            address: std::mem::take(&mut self.peer_address),
+            os: None,
+            screens: std::mem::take(&mut self.last_peer_screens),
+            send: rules.send,
+            receive: rules.receive,
+        });
+        self.devices.clear();
     }
 
     fn path() -> anyhow::Result<PathBuf> {
@@ -124,7 +164,11 @@ impl Config {
     pub fn load() -> anyhow::Result<Self> {
         let path = Self::path()?;
         match std::fs::read_to_string(&path) {
-            Ok(text) => toml::from_str(&text).with_context(|| format!("parsing {}", path.display())),
+            Ok(text) => {
+                let mut config: Config = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+                config.migrate();
+                Ok(config)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
         }
@@ -134,5 +178,32 @@ impl Config {
         let path = Self::path()?;
         std::fs::write(&path, toml::to_string_pretty(self)?)
             .with_context(|| format!("writing {}", path.display()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_peer_config_moves_into_the_device_list() {
+        let fp = "AB".repeat(32);
+        let old = format!(
+            "device_name = \"laptop\"\npeer_address = \"10.0.0.2\"\npeer_fingerprint = \"{fp}\"\npeer_side = \"Left\"\n\
+             last_peer_name = \"Mac\"\nlayout = \"Proportional\"\n\n[devices.\"{id}\".send]\nclipboard = false\n",
+            id = crate::identity::format(&crate::identity::parse(&fp).unwrap()),
+        );
+        let mut c: Config = toml::from_str(&old).unwrap();
+        c.migrate();
+        let (id, peer) = c.peers.iter().next().unwrap();
+        assert_eq!(id, &crate::identity::format(&crate::identity::parse(&fp).unwrap()));
+        assert_eq!((peer.name.as_str(), peer.address.as_str()), ("Mac", "10.0.0.2"));
+        assert!(!peer.send.clipboard && peer.send.mouse);
+        assert_eq!(c.new_device_side, Side::Left);
+        assert_eq!(c.layout, DisplayLayout::Proportional);
+        // Saved without the old fields; loads back the same.
+        let again: Config = toml::from_str(&toml::to_string_pretty(&c).unwrap()).unwrap();
+        assert_eq!(again.peers, c.peers);
+        assert!(!toml::to_string_pretty(&c).unwrap().contains("peer_fingerprint"));
     }
 }

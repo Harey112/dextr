@@ -72,7 +72,7 @@ When dextr is started from a terminal, macOS asks for these for the **terminal a
 iTerm, …), so that is the entry to switch on. Afterwards press **Ask again** on the Overview page, or
 quit and restart dextr. If macOS asks whether dextr may accept incoming network connections, allow it.
 
-## Pair two devices
+## Pair devices
 
 1. Open dextr on both devices, on the same network.
 2. On one of them, go to **Pairing**. The other device appears under **Nearby devices**: press **Pair**.
@@ -81,8 +81,10 @@ quit and restart dextr. If macOS asks whether dextr may accept incoming network 
 3. Both screens show the same 6-digit code. If they match, press **Codes match** on both.
 
 That's all: they connect now, and from then on by themselves, even after one gets a new IP address.
-Arrange the screens on the **Displays** page; both devices keep the same layout (the newest change wins). Push the pointer off the shared edge to move to the
-other device. **Ctrl+Alt+Esc** always brings it back.
+Pair as many devices as you like; each one connects to all the others. Arrange the screens on the
+**Displays** page: every device keeps the same layout (the newest change wins). Push the pointer off
+a shared edge to move to the device there, and on to the next one from there (A → B → C).
+**Ctrl+Alt+Esc** always brings it back.
 
 dextr uses UDP port **47800** for the connection and **47801** to find devices. On Linux with a
 firewall (Fedora, for example), allow them:
@@ -114,13 +116,14 @@ sharing, or quits. **Launch at login** starts it in the tray without a window (`
 
 ## Displays: Exact or Proportional
 
-* **Exact** (default): real sizes, like the system display settings. Place the other device on any
-  side and slide it along; the pointer crosses only where the edges touch, at the same pixel.
-* **Proportional:** both devices' screens in one flat row, all the same height. The whole edge maps to
-  the whole edge: leaving 30% of the way down yours enters 30% of the way down theirs, whatever the
+* **Exact** (default): real sizes, like the system display settings. Place each device on any
+  side of another and slide it along; the pointer crosses only where the edges touch, at the same pixel.
+* **Proportional:** every device's screens in one flat row, all the same height. The whole edge maps to
+  the whole edge: leaving 30% of the way down one enters 30% of the way down the next, whatever the
   sizes, so there are no dead zones. The edge is the outermost screen on that side.
 
-The arrangement, including the mode, is the same on both devices.
+The arrangement, including the mode, is the same on every device. Newly paired devices are placed
+automatically until you move them.
 
 ## What goes where
 
@@ -132,7 +135,7 @@ over there.
 
 ## Clipboard
 
-Copy on one device, paste on the other: text and images (as PNG), in both directions. Each copy is
+Copy on one device, paste on any other the rules allow: text and images (as PNG), in both directions. Each copy is
 sent once, right away, over the encrypted connection, on a QUIC stream of its own so a large image
 never holds up the mouse or keyboard. Images are compared by their pixels, so a picture re-encoded
 by the other OS isn't sent back. Turn it off, leave images out, or cap the size on the **Clipboard**

@@ -11,6 +11,7 @@ pub mod discovery;
 pub mod edge;
 pub mod identity;
 pub mod settings;
+pub mod world;
 mod engine;
 mod tls;
 

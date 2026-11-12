@@ -1,9 +1,8 @@
 use dextr_core::{
     Mode, PairingState,
-    edge::Link,
     settings::{Appearance, Channel, DisplayLayout, ModifierMap, ReturnShortcut},
 };
-use dextr_proto::{DEFAULT_PORT, Os, Rect, Side};
+use dextr_proto::{DEFAULT_PORT, Os, Rect};
 use iced::{
     Alignment, Background, Border, Color, Element, Font, Length, Theme,
     widget::{
@@ -130,19 +129,19 @@ fn card<'a>(code: char, title: &'a str, body: impl Into<Element<'a, Message>>) -
     card_with(code, title, None, body)
 }
 
-fn card_help<'a>(code: char, title: &'a str, help_text: &'a str, body: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
-    card_with(code, title, Some(help_text), body)
+fn card_help<'a>(code: char, title: &'a str, help_text: impl text::IntoFragment<'a>, body: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    card_with(code, title, Some(help(help_text)), body)
 }
 
-fn card_with<'a>(code: char, title: &'a str, help_text: Option<&'a str>, body: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+fn card_with<'a>(code: char, title: &'a str, help_mark: Option<Element<'a, Message>>, body: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
     let mut header = row![
         icon(code).size(17).style(|theme: &Theme| text::Style { color: Some(theme.extended_palette().primary.base.color) }),
         text(title).size(15).font(SEMIBOLD),
     ]
     .spacing(9)
     .align_y(Alignment::Center);
-    if let Some(h) = help_text {
-        header = header.push(help(h));
+    if let Some(h) = help_mark {
+        header = header.push(h);
     }
     container(column![header, body.into()].spacing(16))
         .padding(20)
@@ -205,10 +204,15 @@ fn field<'a>(label: &'a str, input: impl Into<Element<'a, Message>>) -> Element<
     column![text(label).size(13).font(MEDIUM), input.into()].spacing(6).into()
 }
 
-/// A setting row: name and help circle on the left, control on the right.
+/// A setting row: name (and a help circle if there's more to say) on the
+/// left, control on the right.
 fn setting<'a>(title: &'a str, description: &'a str, control: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    let mut name = row![text(title).size(14)].spacing(6).align_y(Alignment::Center).width(Length::Fill);
+    if !description.is_empty() {
+        name = name.push(help(description));
+    }
     row![
-        row![text(title).size(14), help(description)].spacing(6).align_y(Alignment::Center).width(Length::Fill),
+        name,
         control.into(),
     ]
     .spacing(16)
@@ -271,30 +275,57 @@ fn banner<'a>(content: impl Into<Element<'a, Message>>, tone: Tone) -> container
 }
 
 fn mode_chip(app: &App) -> Element<'_, Message> {
-    match (app.mode, &app.peer) {
-        (None, _) => chip("Starting", Tone::Neutral),
-        (Some(Mode::Controlling), _) => chip("Controlling", Tone::Active),
-        (Some(Mode::Controlled), _) => chip("Controlled", Tone::Active),
-        (Some(Mode::Local), Some(_)) if app.paused => chip("Paused", Tone::Warn),
-        (Some(Mode::Local), Some(_)) => chip("Connected", Tone::Good),
-        (Some(Mode::Local), None) if app.connecting => chip("Connecting", Tone::Neutral),
-        (Some(Mode::Local), None) if app.reconnect_in.is_some() => chip("Reconnecting", Tone::Warn),
-        (Some(Mode::Local), None) => chip("Offline", Tone::Neutral),
+    let connected = app.peers.len();
+    match &app.mode {
+        None => chip("Starting", Tone::Neutral),
+        Some(Mode::Controlling(_)) => chip("Controlling", Tone::Active),
+        Some(Mode::Controlled(_)) => chip("Controlled", Tone::Active),
+        Some(Mode::Local) if connected > 0 && app.paused => chip("Paused", Tone::Warn),
+        Some(Mode::Local) if connected > 0 => chip("Connected", Tone::Good),
+        Some(Mode::Local) if !app.connecting.is_empty() => chip("Connecting", Tone::Neutral),
+        Some(Mode::Local) if !app.reconnect_in.is_empty() => chip("Reconnecting", Tone::Warn),
+        Some(Mode::Local) => chip("Offline", Tone::Neutral),
     }
 }
 
+/// Connect to or disconnect from every paired device.
 fn connect_button(app: &App) -> button::Button<'_, Message> {
     let label = |code, s| container(with_icon(code, s)).center_x(Length::Fill);
-    if app.peer.is_some() {
-        button(label(ic::UNPLUG, "Disconnect")).style(button::secondary).on_press(Message::Disconnect)
-    } else if app.connecting {
-        button(label(ic::PLUG, "Connecting…")).style(button::secondary)
-    } else if app.reconnect_in.is_some() {
-        button(label(ic::UNPLUG, "Stop reconnecting")).style(button::secondary).on_press(Message::Disconnect)
+    let busy = !app.peers.is_empty() || !app.connecting.is_empty() || !app.reconnect_in.is_empty();
+    if busy {
+        let text = if app.config().peers.len() > 1 { "Disconnect all" } else { "Disconnect" };
+        button(label(ic::UNPLUG, text)).style(button::secondary).on_press(Message::Disconnect(None))
     } else {
-        button(label(ic::PLUG, "Connect"))
+        let text = if app.config().peers.len() > 1 { "Connect all" } else { "Connect" };
+        button(label(ic::PLUG, text))
             .style(button::primary)
-            .on_press_maybe(app.saved.is_some().then_some(Message::Connect))
+            .on_press_maybe((!app.config().peers.is_empty()).then_some(Message::Connect(None)))
+    }
+}
+
+/// Connect or disconnect one device.
+fn device_button<'a>(app: &'a App, id: &'a str) -> Element<'a, Message> {
+    if app.peers.contains_key(id) {
+        button(with_icon(ic::UNPLUG, "Disconnect")).style(button::secondary).on_press(Message::Disconnect(Some(id.to_owned()))).into()
+    } else if app.connecting.contains(id) {
+        button(with_icon(ic::PLUG, "Connecting…")).style(button::secondary).into()
+    } else if app.reconnect_in.contains_key(id) {
+        button(with_icon(ic::UNPLUG, "Stop")).style(button::secondary).on_press(Message::Disconnect(Some(id.to_owned()))).into()
+    } else {
+        button(with_icon(ic::PLUG, "Connect")).style(button::primary).on_press(Message::Connect(Some(id.to_owned()))).into()
+    }
+}
+
+/// A device's connection state as a chip.
+fn device_chip<'a>(app: &App, id: &str) -> Element<'a, Message> {
+    if app.peers.contains_key(id) {
+        chip("Connected", Tone::Good)
+    } else if app.connecting.contains(id) {
+        chip("Connecting", Tone::Neutral)
+    } else if let Some(secs) = app.reconnect_in.get(id) {
+        chip(format!("Retry in {secs} s"), Tone::Warn)
+    } else {
+        chip("Offline", Tone::Neutral)
     }
 }
 
@@ -304,10 +335,10 @@ fn icon_button<'a>(code: char, label: &'a str, message: Message) -> button::Butt
 
 /// A destructive action with a second click to confirm.
 fn danger_row<'a>(app: &App, title: &'a str, description: &'a str, action: &'a str, danger: Danger) -> Element<'a, Message> {
-    let control: Element<'a, Message> = if app.confirm == Some(danger) {
+    let control: Element<'a, Message> = if app.confirm.as_ref() == Some(&danger) {
         row![
             button("Cancel").style(button::secondary).on_press(Message::Cancel),
-            button(text(format!("Yes, {}", action.to_lowercase()))).style(button::danger).on_press(Message::Confirm(danger)),
+            button(text(format!("Yes, {}", action.to_lowercase()))).style(button::danger).on_press(Message::Confirm(danger.clone())),
         ]
         .spacing(8)
         .into()
@@ -315,10 +346,6 @@ fn danger_row<'a>(app: &App, title: &'a str, description: &'a str, action: &'a s
         button(action).style(button::secondary).on_press(Message::Arm(danger)).into()
     };
     setting(title, description, control)
-}
-
-fn side_word(side: Side) -> String {
-    side.to_string().to_lowercase()
 }
 
 fn this_name(app: &App) -> &str {
@@ -381,12 +408,18 @@ fn sidebar(app: &App) -> Element<'_, Message> {
     }))
     .spacing(2);
 
-    let peer_line: Element<'_, Message> = match (&app.peer, app.reconnect_in) {
-        (Some(p), _) => column![text(&p.name).size(13).font(MEDIUM), muted(format!("{} · {}", os_name(p.os), p.address)).size(12)]
-            .spacing(2)
-            .into(),
-        (None, Some(secs)) => muted(format!("Retrying in {secs} s…")).size(12).into(),
-        (None, None) => muted("No device connected").size(12).into(),
+    let peer_line: Element<'_, Message> = if app.peers.is_empty() {
+        let paired = app.config().peers.len();
+        muted(if paired == 0 { "No device paired".to_owned() } else { format!("0 of {paired} devices connected") }).size(12).into()
+    } else {
+        column(app.peers.values().map(|p| {
+            row![icon(ic::LAPTOP).size(13), text(&p.name).size(13).font(MEDIUM), muted(os_name(p.os)).size(11)]
+                .spacing(6)
+                .align_y(Alignment::Center)
+                .into()
+        }))
+        .spacing(4)
+        .into()
     };
 
     container(
@@ -415,16 +448,18 @@ fn sidebar(app: &App) -> Element<'_, Message> {
 }
 
 fn arrangement_canvas(app: &App, interactive: bool, height: f32) -> Element<'_, Message> {
-    let peer_label: &str = app.peer.as_ref().map(|p| p.name.as_str()).unwrap_or_else(|| {
-        app.saved.as_ref().and_then(|c| c.last_peer_name.as_deref()).unwrap_or("Other device")
-    });
-    let on_change: fn(Link) -> Message = |l| Message::Set(Setting::Arrange(l));
+    let c = app.config();
+    let mut names: std::collections::BTreeMap<String, String> = c.peers.keys().map(|id| (id.clone(), app.device_name(id))).collect();
+    names.insert(app.fingerprint.clone(), this_name(app).to_owned());
+    let on_change: fn(dextr_core::world::Arrangement) -> Message = |a| Message::Set(Setting::Arrange(a));
     canvas(Arrangement {
-        local: &app.local_screens,
-        peer: app.peer_screens(),
-        link: app.config().link(),
-        local_label: this_name(app),
-        peer_label,
+        me: &app.fingerprint,
+        screens: app.all_screens(),
+        names,
+        connected: app.peers.keys().cloned().collect(),
+        shared: &c.arrangement,
+        proportional: c.layout == DisplayLayout::Proportional,
+        new_side: c.new_device_side,
         on_change: interactive.then_some(on_change),
     })
     .width(Length::Fill)
@@ -435,26 +470,24 @@ fn arrangement_canvas(app: &App, interactive: bool, height: f32) -> Element<'_, 
 // ── Per-device rules ─────────────────────────────────────────────────────
 
 /// Each paired device, with a switch per direction for `channel`.
-fn device_rules<'a>(app: &'a App, channel: Channel, out_text: &'a str, in_text: &'a str) -> Element<'a, Message> {
-    let devices = &app.config().devices;
+fn device_rules<'a>(app: &'a App, channel: Channel) -> Element<'a, Message> {
+    let devices = &app.config().peers;
     if devices.is_empty() {
         return card(ic::LAPTOP, "Devices", muted("Pair and connect a device to choose what goes to it and what comes from it."));
     }
     let me = this_name(app);
     let rows = devices.iter().map(|(fp, rules)| {
         let name = if rules.name.is_empty() { "Paired device" } else { rules.name.as_str() };
-        let connected = app.peer.as_ref().is_some_and(|p| p.name == rules.name);
         let rule = |outgoing: bool, on: bool| {
             let device = fp.clone();
             toggler(on).on_toggle(move |v| Message::Set(Setting::Rule { device: device.clone(), outgoing, channel, on: v }))
         };
-        let direction = |from: String, to: String, what: &'a str, outgoing: bool, on: bool| -> Element<'a, Message> {
+        let direction = |from: String, to: String, outgoing: bool, on: bool| -> Element<'a, Message> {
             row![
                 row![
                     text(from).size(13).font(MEDIUM),
                     icon(ic::TO).size(14),
                     text(to).size(13).font(MEDIUM),
-                    help(what),
                 ]
                 .spacing(8)
                 .align_y(Alignment::Center)
@@ -468,12 +501,12 @@ fn device_rules<'a>(app: &'a App, channel: Channel, out_text: &'a str, in_text: 
             row![
                 icon(ic::LAPTOP),
                 text(name).size(14).font(SEMIBOLD),
-                if connected { chip("Connected", Tone::Good) } else { chip("Offline", Tone::Neutral) },
+                device_chip(app, fp),
             ]
             .spacing(10)
             .align_y(Alignment::Center),
-            direction(me.to_string(), name.to_string(), out_text, true, rules.send.get(channel)),
-            direction(name.to_string(), me.to_string(), in_text, false, rules.receive.get(channel)),
+            direction(me.to_string(), name.to_string(), true, rules.send.get(channel)),
+            direction(name.to_string(), me.to_string(), false, rules.receive.get(channel)),
         ]
         .spacing(12)
         .into()
@@ -481,7 +514,7 @@ fn device_rules<'a>(app: &'a App, channel: Channel, out_text: &'a str, in_text: 
     card_help(
         ic::LAPTOP,
         "Devices",
-        "Choose per device, and per direction, what is shared. Both this switch and the page's main switch must be on.",
+        "Choose, per device and per direction, what is shared. It's shared only when both this switch and the page's main switch are on.",
         column(rows).spacing(20),
     )
 }
@@ -489,20 +522,37 @@ fn device_rules<'a>(app: &'a App, channel: Channel, out_text: &'a str, in_text: 
 // ── Overview ─────────────────────────────────────────────────────────────
 
 fn overview(app: &App) -> Element<'_, Message> {
-    let side = side_word(app.config().peer_side);
-    let (status, detail): (String, String) = match (&app.peer, app.mode) {
-        (Some(p), Some(Mode::Controlling)) => (format!("Controlling {}", p.name), "Your mouse and keyboard are on the other device.".into()),
-        (Some(p), Some(Mode::Controlled)) => (format!("{} is controlling this device", p.name), "Its mouse and keyboard are on this screen.".into()),
-        (Some(p), _) => (format!("Connected to {}", p.name), format!("{} at {}. Push the pointer past the {side} edge to switch.", os_name(p.os), p.address)),
-        (None, _) if app.connecting => ("Connecting…".into(), format!("Reaching {}", app.form.address)),
-        (None, _) if app.reconnect_in.is_some() => (
-            "Connection lost".into(),
-            format!("Trying {} again in {} s.", app.form.address, app.reconnect_in.unwrap_or_default()),
+    let (status, detail): (String, String) = match &app.mode {
+        Some(Mode::Controlling(id)) => (format!("Controlling {}", app.device_name(id)), "Your mouse and keyboard are on that device.".into()),
+        Some(Mode::Controlled(id)) => (format!("{} is controlling this device", app.device_name(id)), "Its mouse and keyboard are on this screen.".into()),
+        _ if app.config().peers.is_empty() => ("Not paired yet".into(), "Pair with your other devices on the Pairing page.".into()),
+        _ if app.peers.is_empty() => ("Not connected".into(), "Connect to use your paired devices.".into()),
+        _ => (
+            format!("Connected to {} of {} devices", app.peers.len(), app.config().peers.len()),
+            "Push the pointer past an edge with a green line on the Displays page to move to that device.".into(),
         ),
-        (None, _) if app.form.address.is_empty() || app.form.fingerprint.is_empty() => {
-            ("Not paired yet".into(), "Pair with your other device on the Pairing page.".into())
-        }
-        (None, _) => ("Not connected".into(), format!("Ready to connect to {}.", app.form.address)),
+    };
+
+    let devices: Element<'_, Message> = if app.config().peers.is_empty() {
+        muted("No paired devices yet.").into()
+    } else {
+        column(app.config().peers.iter().map(|(id, p)| {
+            let os = app.peer_os(id).map(os_name).unwrap_or("Unknown");
+            let address = app.peers.get(id).map_or(p.address.as_str(), |c| c.address.as_str());
+            row![
+                icon(ic::LAPTOP),
+                column![text(app.device_name(id)).size(14).font(MEDIUM), muted(format!("{os} · {address}")).size(12)]
+                    .spacing(2)
+                    .width(Length::Fill),
+                device_chip(app, id),
+                device_button(app, id),
+            ]
+            .spacing(12)
+            .align_y(Alignment::Center)
+            .into()
+        }))
+        .spacing(12)
+        .into()
     };
 
     let connection = card(
@@ -512,6 +562,7 @@ fn overview(app: &App) -> Element<'_, Message> {
             row![column![text(status).size(20).font(MEDIUM), muted(detail)].spacing(4).width(Length::Fill), connect_button(app).width(170)]
                 .spacing(16)
                 .align_y(Alignment::Center),
+            devices,
             setting(
                 "Share this mouse and keyboard",
                 "Turn off to keep the pointer on this device for a while. Also in the tray menu.",
@@ -525,12 +576,8 @@ fn overview(app: &App) -> Element<'_, Message> {
         ic::DISPLAYS,
         "Arrangement",
         column![
-            arrangement_canvas(app, false, 170.0),
-            row![
-                muted(format!("{} is on the {side} of this device.", app.peer_name())).width(Length::Fill),
-                icon_button(ic::SLIDERS, "Arrange displays", Message::Navigate(Page::Displays)),
-            ]
-            .align_y(Alignment::Center),
+            arrangement_canvas(app, false, 180.0),
+            row![space::horizontal(), icon_button(ic::SLIDERS, "Arrange displays", Message::Navigate(Page::Displays))],
         ]
         .spacing(10),
     );
@@ -552,7 +599,7 @@ fn permissions_card(app: &App) -> Element<'_, Message> {
             Access::Granted => (chip("Allowed", Tone::Good), None),
             Access::Denied(reason) => (chip("Unavailable", Tone::Bad), Some(reason.as_str())),
         };
-        let mut info = column![row![text(what).size(14), help(why)].spacing(6).align_y(Alignment::Center)].spacing(4).width(Length::Fill);
+        let mut info = column![text(what).size(14), muted(why).size(12)].spacing(2).width(Length::Fill);
         if let Some(d) = detail {
             info = info.push(muted(d).size(12));
         }
@@ -560,8 +607,8 @@ fn permissions_card(app: &App) -> Element<'_, Message> {
     }
     let any_denied = matches!(app.capture, Access::Denied(_)) || matches!(app.inject, Access::Denied(_));
     let mut body = column![
-        line("Control the other device", "Lets this mouse and keyboard move to the other screen.", &app.capture),
-        line("Be controlled", "Lets the other device's mouse and keyboard work here.", &app.inject),
+        line("Control other devices", "Lets this mouse and keyboard move to their screens.", &app.capture),
+        line("Be controlled", "Lets their mouse and keyboard work here.", &app.inject),
     ]
     .spacing(14);
     if any_denied {
@@ -602,23 +649,26 @@ fn layout_switch(current: DisplayLayout) -> Element<'static, Message> {
 fn displays(app: &App) -> Element<'_, Message> {
     let c = app.config();
     let proportional = c.layout == DisplayLayout::Proportional;
-    let details = row![
+    let mut details = column![
         column![text(this_name(app)).size(14).font(MEDIUM), screen_list(&app.local_screens, "Screens appear once input permissions are allowed.")]
             .spacing(8)
-            .width(Length::Fill),
-        column![text(app.peer_name()).size(14).font(MEDIUM), screen_list(app.peer_screens().unwrap_or_default(), "Not connected.")]
-            .spacing(8)
-            .width(Length::Fill),
     ]
-    .spacing(24);
+    .spacing(18);
+    for (id, p) in &c.peers {
+        let screens = app.peers.get(id).map_or(p.screens.as_slice(), |c| c.screens.as_slice());
+        details = details.push(
+            column![text(app.device_name(id)).size(14).font(MEDIUM), screen_list(screens, "Not known yet: connect once.")].spacing(8),
+        );
+    }
 
-    let switching = card(
+    let switching = card_help(
         ic::ZAP,
         "Switching",
+        "Dead corners ignore crossings near the ends of an edge, so corners stay usable. Switch delay makes you push against the edge that long before crossing; moving away cancels.",
         settings_list(vec![
             slide(
                 "Dead corners",
-                "Crossing is ignored this close to the ends of the edge, so corners stay usable.",
+                "",
                 0.0..=120.0,
                 4.0,
                 c.switching.dead_corners as f32,
@@ -627,7 +677,7 @@ fn displays(app: &App) -> Element<'_, Message> {
             ),
             slide(
                 "Switch delay",
-                "Push against the edge this long before switching. Moving away cancels.",
+                "",
                 0.0..=1000.0,
                 50.0,
                 c.switching.delay_ms as f32,
@@ -638,23 +688,23 @@ fn displays(app: &App) -> Element<'_, Message> {
     );
 
     let layout_help = if proportional {
-        "Proportional: the screens sit in one row, all the same height. Leaving 30% of the way down your edge enters 30% of the way down theirs, whatever the sizes, so there are no dead zones. Drag the other device's screens left or right."
+        "Shared by all devices: a change on one updates the rest.\n\nProportional: screens sit in one row at the same height. Leaving 30% of the way down an edge enters 30% of the way down the next, whatever the sizes. Drag devices left or right to reorder."
     } else {
-        "Exact: real sizes, like the system display settings. Drag the screens to any side and slide them along it. The pointer crosses only where the edges touch (the green line), at the same spot on both screens; they snap to centered or aligned edges when close."
+        "Shared by all devices: a change on one updates the rest.\n\nExact: real sizes, like the system display settings. Drag devices to any side; the pointer crosses only where edges touch (the green lines). Screens snap to aligned edges when close."
     };
     let arrangement = card_help(
         ic::DISPLAYS,
         "Arrangement",
-        "The arrangement is shared: the other device shows the same layout from its side, and a change on either one updates both.",
+        layout_help,
         column![
-            setting("Layout", layout_help, layout_switch(c.layout)),
+            setting("Layout", "", layout_switch(c.layout)),
             arrangement_canvas(app, true, 320.0),
         ]
         .spacing(14),
     );
 
     column![
-        heading(ic::DISPLAYS, "Displays", "Where the other device sits, and how the pointer crosses.", None),
+        heading(ic::DISPLAYS, "Displays", "Where your devices sit, and how the pointer crosses.", None),
         arrangement,
         switching,
         card(ic::INFO, "Screens", details),
@@ -680,7 +730,7 @@ fn pairing(app: &App) -> Element<'_, Message> {
         page = page.push(banner(text(error.as_str()).size(13), Tone::Bad));
     }
     page.push(this_device(app))
-        .push(paired_device(app))
+        .push(paired_devices(app))
         .push(nearby_devices(app))
         .push(pair_by_address(app))
         .push(pairing_help())
@@ -774,33 +824,39 @@ fn this_device(app: &App) -> Element<'_, Message> {
     )
 }
 
-fn paired_device(app: &App) -> Element<'_, Message> {
-    let Some(saved) = app.saved.as_ref().filter(|c| !c.peer_fingerprint.is_empty()) else {
-        return card(ic::PAIRING, "Paired device", muted("None yet. Pair with a device below."));
-    };
-    let name = app.peer.as_ref().map(|p| p.name.as_str()).or(saved.last_peer_name.as_deref()).unwrap_or("Paired device");
-    let status = if app.peer.is_some() { chip("Connected", Tone::Good) } else { chip("Not connected", Tone::Neutral) };
-    card(
+fn paired_devices(app: &App) -> Element<'_, Message> {
+    let peers = &app.config().peers;
+    if peers.is_empty() {
+        return card(ic::PAIRING, "Paired devices", muted("None yet. Pair with a device below."));
+    }
+    card_help(
         ic::PAIRING,
-        "Paired device",
-        column![
-            row![
-                column![text(name).size(15).font(MEDIUM), muted(saved.peer_address.as_str()).size(12).font(Font::MONOSPACE)]
-                    .spacing(2)
-                    .width(Length::Fill),
-                status,
-                connect_button(app).width(160),
+        "Paired devices",
+        "Paired devices connect to each other by themselves. Pair with as many as you like; arrange them on the Displays page.",
+        column(peers.iter().map(|(id, p)| {
+            let address = app.peers.get(id).map_or(p.address.as_str(), |c| c.address.as_str());
+            column![
+                row![
+                    icon(ic::LAPTOP),
+                    column![text(app.device_name(id)).size(15).font(MEDIUM), muted(address).size(12).font(Font::MONOSPACE)]
+                        .spacing(2)
+                        .width(Length::Fill),
+                    device_chip(app, id),
+                    device_button(app, id),
+                ]
+                .spacing(12)
+                .align_y(Alignment::Center),
+                danger_row(app, "Forget this device", "", "Forget", Danger::ForgetPeer(id.clone())),
             ]
-            .spacing(12)
-            .align_y(Alignment::Center),
-            danger_row(app, "Forget this device", "It will need to be paired again.", "Forget", Danger::ForgetPeer),
-        ]
-        .spacing(14),
+            .spacing(10)
+            .into()
+        }))
+        .spacing(20),
     )
 }
 
 fn nearby_devices(app: &App) -> Element<'_, Message> {
-    let can_pair = app.pairing.is_none() && app.peer.is_none();
+    let can_pair = app.pairing.is_none();
     let list: Element<'_, Message> = if app.nearby.is_empty() {
         muted("Looking for other devices running dextr on this network…").into()
     } else {
@@ -830,15 +886,11 @@ fn nearby_devices(app: &App) -> Element<'_, Message> {
         .spacing(12)
         .into()
     };
-    let mut body = column![list].spacing(10);
-    if app.peer.is_some() && app.nearby.iter().any(|n| !n.paired) {
-        body = body.push(muted("Disconnect first to pair with another device.").size(12));
-    }
-    card_help(ic::RADAR, "Nearby devices", "Devices running dextr on this network appear here by themselves.", body)
+    card(ic::RADAR, "Nearby devices", list)
 }
 
 fn pair_by_address(app: &App) -> Element<'_, Message> {
-    let can_pair = app.pairing.is_none() && app.peer.is_none() && !app.pair_address.trim().is_empty();
+    let can_pair = app.pairing.is_none() && !app.pair_address.trim().is_empty();
     let go = can_pair.then(|| Message::PairWith(app.pair_address.clone()));
     card_help(
         ic::NETWORK,
@@ -859,12 +911,11 @@ fn pair_by_address(app: &App) -> Element<'_, Message> {
 
 fn pairing_help<'a>() -> Element<'a, Message> {
     const FIREWALLD: &str = "sudo firewall-cmd --permanent --add-port=47800-47801/udp && sudo firewall-cmd --reload";
-    card_help(
+    card(
         ic::INFO,
         "Not finding each other?",
-        "Open dextr on both devices on the same network. dextr uses UDP ports 47800 (connection) and 47801 (finding devices). On macOS, allow dextr if it asks to accept incoming connections.",
         column![
-            muted("On Linux with a firewall, such as Fedora, allow dextr's ports:"),
+            muted("Open dextr on both devices on the same network. It uses UDP ports 47800 and 47801; on macOS, allow incoming connections if asked. On Linux with a firewall, such as Fedora, allow those ports:"),
             row![
                 container(text(FIREWALLD).font(Font::MONOSPACE).size(12)).padding(9).width(Length::Fill).style(container::bordered_box),
                 icon_button(ic::COPY, "Copy", Message::Copy(FIREWALLD.into())),
@@ -900,14 +951,14 @@ fn mouse(app: &App) -> Element<'_, Message> {
         settings_list(vec![
             slide(
                 "Pointer speed",
-                "How fast the pointer moves on the other device, relative to this one.",
+                "",
                 0.25..=3.0,
                 0.05,
                 m.speed,
                 format!("{:.2}×", m.speed),
                 Setting::PointerSpeed,
             ),
-            switch("Swap left and right buttons", "For left-handed use on the other device.", m.swap_buttons, Setting::SwapButtons),
+            switch("Swap left and right buttons", "", m.swap_buttons, Setting::SwapButtons),
         ]),
     );
     let scrolling = card(
@@ -916,7 +967,7 @@ fn mouse(app: &App) -> Element<'_, Message> {
         settings_list(vec![
             slide(
                 "Scroll speed",
-                "How far each scroll moves on the other device.",
+                "",
                 0.25..=3.0,
                 0.05,
                 m.scroll_speed,
@@ -925,18 +976,13 @@ fn mouse(app: &App) -> Element<'_, Message> {
             ),
             switch(
                 "Natural scrolling",
-                "Content follows your fingers, like a phone. Reverses the direction on the other device.",
+                "",
                 m.natural_scroll,
                 Setting::NaturalScroll,
             ),
         ]),
     );
-    page.push(device_rules(
-        app,
-        Channel::Mouse,
-        "This mouse can move onto that device's screens.",
-        "That device's mouse can move onto this device and control it.",
-    ))
+    page.push(device_rules(app, Channel::Mouse))
     .push(pointer)
     .push(scrolling)
     .into()
@@ -946,12 +992,19 @@ fn mouse(app: &App) -> Element<'_, Message> {
 
 fn keyboard(app: &App) -> Element<'_, Message> {
     let k = &app.config().keyboard;
-    let explain = match app.peer_os() {
-        Some(peer) => {
-            let effective = k.effective(Os::current(), peer);
-            format!("With {} ({}) this means: {}.", app.peer_name(), os_name(peer), effective.to_string().to_lowercase())
-        }
-        None => "Automatic swaps Ctrl and Cmd when exactly one of the two devices is a Mac, so copy and paste stay under the same finger.".into(),
+    let explain = if app.config().peers.is_empty() {
+        "Automatic swaps Ctrl and Cmd when exactly one of the two devices is a Mac, so copy and paste stay under the same finger.".to_owned()
+    } else {
+        app.config()
+            .peers
+            .keys()
+            .filter_map(|id| {
+                let os = app.peer_os(id)?;
+                let effective = k.effective(Os::current(), os);
+                Some(format!("With {} ({}): {}.", app.device_name(id), os_name(os), effective.to_string().to_lowercase()))
+            })
+            .collect::<Vec<_>>()
+            .join("  ")
     };
 
     let mut page = column![heading(
@@ -969,7 +1022,7 @@ fn keyboard(app: &App) -> Element<'_, Message> {
         ic::COMMAND,
         "Modifier keys",
         column![
-            choose("Mapping", "How Ctrl, Alt and Cmd/Super are sent.", ModifierMap::ALL, k.modifiers, Setting::Modifiers),
+            choose("Mapping", "", ModifierMap::ALL, k.modifiers, Setting::Modifiers),
             muted(explain).size(12),
         ]
         .spacing(10),
@@ -989,7 +1042,7 @@ fn keyboard(app: &App) -> Element<'_, Message> {
         column![
             choose(
                 "Bring the pointer back",
-                "Works from the other device at any time. This key isn't sent to it.",
+                "Works from any device at any time. This key isn't sent.",
                 ReturnShortcut::ALL,
                 k.return_shortcut,
                 Setting::ReturnShortcut,
@@ -999,12 +1052,7 @@ fn keyboard(app: &App) -> Element<'_, Message> {
         .spacing(10),
     );
 
-    page.push(device_rules(
-        app,
-        Channel::Keyboard,
-        "Keys typed here go to that device while the pointer is on it.",
-        "Keys typed on that device go to this one while its pointer is here.",
-    ))
+    page.push(device_rules(app, Channel::Keyboard))
     .push(modifiers)
     .push(shortcuts)
     .push(card_help(
@@ -1033,12 +1081,12 @@ fn clipboard(app: &App) -> Element<'_, Message> {
     let options = card_help(
         ic::SLIDERS,
         "Options",
-        "Whatever you copy is sent right away over the encrypted connection, so it's ready to paste wherever the pointer is. Text and images are supported; files aren't yet.",
+        "Whatever you copy is sent right away over the encrypted connection, so it's ready to paste wherever the pointer is. Text and images are supported; files aren't yet. Copies over the size limit stay on their device.",
         settings_list(vec![
-            switch("Include images", "Screenshots and copied pictures go across too.", c.images, Setting::ClipboardImages),
+            switch("Include images", "", c.images, Setting::ClipboardImages),
             slide(
                 "Largest copy",
-                "Bigger copies stay on the device they were made on.",
+                "",
                 1.0..=256.0,
                 1.0,
                 c.max_mb as f32,
@@ -1047,12 +1095,7 @@ fn clipboard(app: &App) -> Element<'_, Message> {
             ),
         ]),
     );
-    page.push(device_rules(
-        app,
-        Channel::Clipboard,
-        "What you copy here can be pasted on that device.",
-        "What you copy on that device can be pasted here.",
-    ))
+    page.push(device_rules(app, Channel::Clipboard))
     .push(options)
     .into()
 }
@@ -1084,7 +1127,7 @@ fn settings(app: &App) -> Element<'_, Message> {
         ic::LAPTOP,
         "Device",
         column![
-            field("Name", text_input("Shown on the other device", &app.form.name).on_input(Message::Name).on_submit(Message::Save).padding(9)),
+            field("Name", text_input("Shown on your other devices", &app.form.name).on_input(Message::Name).on_submit(Message::Save).padding(9)),
             field("Port (UDP)", text_input("47800", &app.form.port).on_input(Message::Port).on_submit(Message::Save).padding(9).width(140)),
             muted(match (app.listening, port_changed) {
                 (_, true) => "The new port takes effect after restarting dextr.".to_string(),
@@ -1097,7 +1140,7 @@ fn settings(app: &App) -> Element<'_, Message> {
     );
 
     let startup_desc = if autostart::supported() {
-        "Start dextr in the tray when you log in."
+        ""
     } else {
         "Not available on this OS yet."
     };
@@ -1110,10 +1153,10 @@ fn settings(app: &App) -> Element<'_, Message> {
                 startup_desc,
                 toggler(app.launch_at_login).on_toggle_maybe(autostart::supported().then_some(Message::LaunchAtLogin)),
             ),
-            switch("Connect automatically", "Connect to the paired device when dextr starts.", c.connection.auto_connect, Setting::AutoConnect),
+            switch("Connect automatically", "", c.connection.auto_connect, Setting::AutoConnect),
             switch(
                 "Reconnect automatically",
-                "Keep trying after the connection drops, waiting up to 30 seconds between tries.",
+                "",
                 c.connection.auto_reconnect,
                 Setting::AutoReconnect,
             ),
@@ -1133,7 +1176,7 @@ fn settings(app: &App) -> Element<'_, Message> {
             ),
             switch(
                 "Accept incoming connections",
-                "When off, only this device can start a connection.",
+                "",
                 c.connection.allow_incoming,
                 Setting::AllowIncoming,
             ),
@@ -1143,7 +1186,7 @@ fn settings(app: &App) -> Element<'_, Message> {
     let appearance = card(
         ic::PALETTE,
         "Appearance",
-        settings_list(vec![choose("Theme", "Colors used by this window.", Appearance::ALL, c.appearance, Setting::Appearance)]),
+        settings_list(vec![choose("Theme", "", Appearance::ALL, c.appearance, Setting::Appearance)]),
     );
 
     let config_dir = dextr_core::config::dir().map(|d| d.display().to_string()).unwrap_or_else(|e| e.to_string());
@@ -1163,7 +1206,6 @@ fn settings(app: &App) -> Element<'_, Message> {
         ic::ROTATE,
         "Reset",
         settings_list(vec![
-            danger_row(app, "Forget paired device", "Disconnect and remove its address and fingerprint.", "Forget", Danger::ForgetPeer),
             danger_row(
                 app,
                 "New fingerprint",
@@ -1175,7 +1217,7 @@ fn settings(app: &App) -> Element<'_, Message> {
                 "Reset fingerprint",
                 Danger::NewFingerprint,
             ),
-            danger_row(app, "Reset all settings", "Restore defaults. Keeps pairing, name and port.", "Reset", Danger::ResetSettings),
+            danger_row(app, "Reset all settings", "Restore defaults. Keeps pairings, name and port.", "Reset", Danger::ResetSettings),
         ]),
     );
 

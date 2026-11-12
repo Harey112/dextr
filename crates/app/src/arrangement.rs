@@ -1,9 +1,17 @@
-//! Display arrangement: this device's screens and the peer's, drawn to scale
-//! in pixels like the OS display settings. Drag the peer's screens anywhere
-//! around yours; on release they snap to the nearest side, stay where they
-//! were dropped along it, and align to the edges or center when close.
+//! Display arrangement: every paired device's screens in one shared layout,
+//! drawn to scale.
+//!
+//! * Exact: drag another device anywhere; on release it snaps to the nearest
+//!   device's edge, stays where it was dropped along it, and aligns to the
+//!   edges or center when close.
+//! * Proportional: the devices sit in one row at the same height; drag one
+//!   left or right to change the order.
+//!
+//! The green lines are where the pointer crosses between devices.
 
-use dextr_core::edge::Link;
+use std::collections::{BTreeMap, BTreeSet};
+
+use dextr_core::world::{Area2, Arrangement as Shared, DeviceId, World};
 use dextr_proto::{Rect, Side};
 use iced::{
     Color, Point, Rectangle, Renderer, Size, Theme, Vector,
@@ -13,45 +21,44 @@ use iced::{
 
 /// Shown when this device's screens aren't known yet.
 const PLACEHOLDER: Rect = Rect::new(0, 0, 1920, 1080);
-
 /// Snap to aligned edges or center within this fraction of the edge length.
 const SNAP: f32 = 0.04;
+/// How much of two edges must touch at least.
+const MIN_OVERLAP: f32 = 64.0;
 
 pub struct Arrangement<'a, M> {
-    pub local: &'a [Rect],
-    /// The peer's screens, only while connected.
-    pub peer: Option<&'a [Rect]>,
-    pub link: Link,
-    pub local_label: &'a str,
-    pub peer_label: &'a str,
-    pub on_change: Option<fn(Link) -> M>,
+    /// This device.
+    pub me: &'a str,
+    /// Every device's screens (in its own pixels).
+    pub screens: BTreeMap<DeviceId, Vec<Rect>>,
+    pub names: BTreeMap<DeviceId, String>,
+    pub connected: BTreeSet<DeviceId>,
+    pub shared: &'a Shared,
+    pub proportional: bool,
+    pub new_side: Side,
+    pub on_change: Option<fn(Shared) -> M>,
 }
 
 #[derive(Default)]
 pub struct State {
-    /// Cursor offset from the peer group's top-left while dragging.
-    grab: Option<Vector>,
-    /// Peer group's top-left while dragging, in canvas pixels.
+    /// The device being dragged and the cursor's offset from its top-left.
+    grab: Option<(DeviceId, Vector)>,
+    /// Its top-left while dragging, in canvas pixels.
     drag_at: Option<Point>,
 }
 
-/// Screens in canvas pixels, plus the mapping from our pixel coordinates.
-struct Layout {
-    local: Vec<Rectangle>,
-    peer: Vec<Rectangle>,
-    local_bounds: Rectangle,
-    peer_bounds: Option<Rectangle>,
-    ob: Rect,
-    tb: Option<Rect>,
+/// The shared space mapped onto the canvas.
+struct View {
+    world: World,
     origin: Point,
     scale: f32,
 }
 
-impl Layout {
-    fn to_canvas(&self, x: f32, y: f32, w: f32, h: f32) -> Rectangle {
+impl View {
+    fn to_canvas(&self, a: Area2) -> Rectangle {
         Rectangle::new(
-            Point::new(self.origin.x + x * self.scale, self.origin.y + y * self.scale),
-            Size::new(w * self.scale, h * self.scale),
+            Point::new(self.origin.x + a.x * self.scale, self.origin.y + a.y * self.scale),
+            Size::new(a.w * self.scale, a.h * self.scale),
         )
     }
 
@@ -59,139 +66,87 @@ impl Layout {
         ((p.x - self.origin.x) / self.scale, (p.y - self.origin.y) / self.scale)
     }
 
-    /// The peer's bounds placed by `link`, in canvas pixels.
-    fn peer_rect(&self, link: Link) -> Option<Rectangle> {
-        let tb = self.tb?;
-        let (x, y) = link.place(self.ob, tb);
-        Some(self.to_canvas(x as f32, y as f32, tb.w as f32, tb.h as f32))
+    /// The device whose screens are at canvas point `p`.
+    fn device_at(&self, p: Point) -> Option<&dextr_core::world::Device> {
+        self.world.devices.iter().find(|d| d.areas().into_iter().any(|a| self.to_canvas(a).contains(p)))
     }
 }
 
-/// Proportional: the screens of one device side by side in a row, in their
-/// left-to-right order, each scaled to height 1. Returns (x, width) per
-/// screen in the original order, and the row's width.
-fn row(screens: &[Rect]) -> (Vec<(f32, f32)>, f32) {
-    const GAP: f32 = 0.05;
-    let mut order: Vec<usize> = (0..screens.len()).collect();
-    order.sort_by_key(|&i| (screens[i].x, screens[i].y));
-    let mut out = vec![(0.0, 0.0); screens.len()];
-    let mut x = 0.0;
-    for (n, &i) in order.iter().enumerate() {
-        if n > 0 {
-            x += GAP;
-        }
-        let w = screens[i].w as f32 / screens[i].h.max(1) as f32;
-        out[i] = (x, w);
-        x += w;
-    }
-    (out, x)
+fn union(areas: impl Iterator<Item = Area2>) -> Option<Area2> {
+    areas.reduce(|o, a| {
+        let (x, y) = (o.x.min(a.x), o.y.min(a.y));
+        Area2 { x, y, w: o.right().max(a.right()) - x, h: o.bottom().max(a.bottom()) - y }
+    })
+}
+
+/// Empty space between two rectangles (0 when they touch or overlap).
+fn gap(a: Area2, b: Area2) -> f32 {
+    let dx = (a.x - b.right()).max(b.x - a.right()).max(0.0);
+    let dy = (a.y - b.bottom()).max(b.y - a.bottom()).max(0.0);
+    dx.hypot(dy)
 }
 
 impl<M> Arrangement<'_, M> {
-    fn layout(&self, size: Size) -> Layout {
-        self.layout_for(self.link, size)
+    fn screens_with_placeholder(&self) -> BTreeMap<DeviceId, Vec<Rect>> {
+        let mut s: BTreeMap<DeviceId, Vec<Rect>> =
+            self.screens.iter().filter(|(_, v)| !v.is_empty()).map(|(k, v)| (k.clone(), v.clone())).collect();
+        s.entry(self.me.to_owned()).or_insert_with(|| vec![PLACEHOLDER]);
+        s
     }
 
-    fn layout_for(&self, link: Link, size: Size) -> Layout {
-        if link.proportional {
-            return self.row_layout(link.side, size);
-        }
-        let local = if self.local.is_empty() { vec![PLACEHOLDER] } else { self.local.to_vec() };
-        let ob = Rect::bounds(&local).unwrap();
-        let peer = self.peer.filter(|p| !p.is_empty());
-        let tb = peer.and_then(Rect::bounds);
+    fn world_for(&self, shared: &Shared) -> World {
+        World::build(shared, self.proportional, &self.me.to_owned(), &self.screens_with_placeholder(), self.new_side)
+    }
 
-        // Everything in our pixel coordinates.
-        let (mut x0, mut y0) = (ob.x as f32, ob.y as f32);
-        let (mut x1, mut y1) = (ob.right(), ob.bottom());
-        let mut place = (0, 0);
-        if let Some(tb) = tb {
-            place = link.place(ob, tb);
-            x0 = x0.min(place.0 as f32);
-            y0 = y0.min(place.1 as f32);
-            x1 = x1.max((place.0 + tb.w as i32) as f32);
-            y1 = y1.max((place.1 + tb.h as i32) as f32);
-        }
-        // Leave room around a lone screen so it doesn't fill the canvas.
-        let fill = if tb.is_some() { (0.86, 0.80) } else { (0.55, 0.62) };
-        let scale = ((size.width * fill.0) / (x1 - x0)).min((size.height * fill.1) / (y1 - y0));
+    fn view(&self, size: Size) -> View {
+        let world = self.world_for(self.shared);
+        let all = union(world.devices.iter().map(|d| d.world_bounds())).unwrap_or(Area2 { x: 0.0, y: 0.0, w: 1.0, h: 1.0 });
+        let lone = world.devices.len() < 2;
+        let fill = if lone { (0.5, 0.6) } else { (0.88, 0.72) };
+        let scale = ((size.width * fill.0) / all.w).min((size.height * fill.1) / all.h);
         let origin = Point::new(
-            size.width / 2.0 - (x0 + x1) / 2.0 * scale,
-            size.height / 2.0 - (y0 + y1) / 2.0 * scale,
+            size.width / 2.0 - (all.x + all.w / 2.0) * scale,
+            size.height / 2.0 - (all.y + all.h / 2.0) * scale + 8.0,
         );
-
-        let mut layout = Layout {
-            local: Vec::new(),
-            peer: Vec::new(),
-            local_bounds: Rectangle::default(),
-            peer_bounds: None,
-            ob,
-            tb,
-            origin,
-            scale,
-        };
-        layout.local = local.iter().map(|r| layout.to_canvas(r.x as f32, r.y as f32, r.w as f32, r.h as f32)).collect();
-        layout.local_bounds = layout.to_canvas(ob.x as f32, ob.y as f32, ob.w as f32, ob.h as f32);
-        if let (Some(peer), Some(tb)) = (peer, tb) {
-            let (dx, dy) = ((place.0 - tb.x) as f32, (place.1 - tb.y) as f32);
-            layout.peer = peer.iter().map(|r| layout.to_canvas(r.x as f32 + dx, r.y as f32 + dy, r.w as f32, r.h as f32)).collect();
-            layout.peer_bounds = layout.peer_rect(link);
-        }
-        layout
+        View { world, origin, scale }
     }
 
-    /// Proportional: both devices' screens in one flat row, all the same
-    /// height, the other device on the left or right.
-    fn row_layout(&self, side: Side, size: Size) -> Layout {
-        let local = if self.local.is_empty() { vec![PLACEHOLDER] } else { self.local.to_vec() };
-        let peer = self.peer.filter(|p| !p.is_empty()).map(<[Rect]>::to_vec);
-        let (local_row, local_w) = row(&local);
-        let peer_row = peer.as_deref().map(row);
-        const BETWEEN: f32 = 0.18;
+    /// The arrangement with `moving` dropped with its top-left at canvas
+    /// point `top_left`.
+    fn dropped(&self, view: &View, moving: &str, top_left: Point) -> Shared {
+        let world = &view.world;
+        let mut shared = self.shared.clone();
+        let Some(m) = world.device(moving) else { return shared };
+        let (x, y) = view.to_world(top_left);
+        let mover = Area2 { x, y, ..m.world_bounds() };
 
-        let total = local_w + peer_row.as_ref().map_or(0.0, |(_, w)| BETWEEN + w);
-        let fill = if peer.is_some() { 0.88 } else { 0.5 };
-        let scale = (size.width * fill / total).min(size.height * 0.62);
-        let left = (size.width - total * scale) / 2.0;
-        let top = (size.height - scale) / 2.0 + 8.0;
-        let (local_x, peer_x) = match side {
-            Side::Left => (left + peer_row.as_ref().map_or(0.0, |(_, w)| (w + BETWEEN) * scale), left),
-            _ => (left, left + (local_w + BETWEEN) * scale),
-        };
-        let place = |x0: f32, (x, w): (f32, f32)| Rectangle::new(Point::new(x0 + x * scale, top), Size::new(w * scale, scale));
-
-        let mut layout = Layout {
-            local: local_row.iter().map(|&r| place(local_x, r)).collect(),
-            peer: Vec::new(),
-            local_bounds: Rectangle::new(Point::new(local_x, top), Size::new(local_w * scale, scale)),
-            peer_bounds: None,
-            ob: Rect::bounds(&local).unwrap(),
-            tb: peer.as_deref().and_then(Rect::bounds),
-            origin: Point::ORIGIN,
-            scale: 1.0,
-        };
-        if let Some((peer_row, peer_w)) = peer_row {
-            layout.peer = peer_row.iter().map(|&r| place(peer_x, r)).collect();
-            layout.peer_bounds = Some(Rectangle::new(Point::new(peer_x, top), Size::new(peer_w * scale, scale)));
+        if self.proportional {
+            // Order by where each device's center is, the dropped one included.
+            let mut order: Vec<(f32, DeviceId)> = world
+                .devices
+                .iter()
+                .map(|d| {
+                    let b = if d.id == moving { mover } else { d.world_bounds() };
+                    (b.x + b.w / 2.0, d.id.clone())
+                })
+                .collect();
+            order.sort_by(|a, b| a.0.total_cmp(&b.0));
+            shared.row = order.into_iter().map(|(_, id)| id).collect();
+            return shared;
         }
-        layout
-    }
 
-    /// Placement for the peer group dropped with its top-left at `top_left`.
-    fn link_at(&self, layout: &Layout, top_left: Point) -> Option<Link> {
-        if self.link.proportional {
-            // Left or right of this device's row, whichever is nearer.
-            let peer = layout.peer_bounds?;
-            let center = top_left.x + peer.width / 2.0;
-            let side = if center < layout.local_bounds.center_x() { Side::Left } else { Side::Right };
-            return Some(Link { side, offset: None, proportional: true });
-        }
-        let (ob, tb) = (layout.ob, layout.tb?);
-        let (x, y) = layout.to_world(top_left);
-
-        // Nearest side, from the centers.
-        let dx = (x + tb.w as f32 / 2.0 - (ob.x as f32 + ob.w as f32 / 2.0)) / ((ob.w + tb.w) as f32 / 2.0);
-        let dy = (y + tb.h as f32 / 2.0 - (ob.y as f32 + ob.h as f32 / 2.0)) / ((ob.h + tb.h) as f32 / 2.0);
+        // Exact: snap to the nearest other device's edge.
+        let Some(other) = world
+            .devices
+            .iter()
+            .filter(|d| d.id != moving)
+            .min_by(|a, b| gap(mover, a.world_bounds()).total_cmp(&gap(mover, b.world_bounds())))
+        else {
+            return shared;
+        };
+        let ob = other.world_bounds();
+        let dx = (mover.x + mover.w / 2.0 - (ob.x + ob.w / 2.0)) / ((ob.w + mover.w) / 2.0);
+        let dy = (mover.y + mover.h / 2.0 - (ob.y + ob.h / 2.0)) / ((ob.h + mover.h) / 2.0);
         let side = if dx.abs() >= dy.abs() {
             if dx >= 0.0 { Side::Right } else { Side::Left }
         } else if dy >= 0.0 {
@@ -199,20 +154,23 @@ impl<M> Arrangement<'_, M> {
         } else {
             Side::Top
         };
-
-        // Where along that side, snapping to centered or aligned ends.
-        let (start, ol, tl) = if side.is_horizontal() {
-            (y - ob.y as f32, ob.h as i32, tb.h as i32)
-        } else {
-            (x - ob.x as f32, ob.w as i32, tb.w as i32)
+        let (start, ol, tl) = if side.is_horizontal() { (mover.y - ob.y, ob.h, mover.h) } else { (mover.x - ob.x, ob.w, mover.w) };
+        let snap = ol.max(tl) * SNAP;
+        let offset = [(ol - tl) / 2.0, 0.0, ol - tl].into_iter().find(|at| (start - at).abs() <= snap).unwrap_or(start);
+        let min = MIN_OVERLAP.min(ol).min(tl);
+        let offset = offset.clamp(min - tl, ol - min);
+        let origin = match side {
+            Side::Right => (ob.right(), ob.y + offset),
+            Side::Left => (ob.x - mover.w, ob.y + offset),
+            Side::Bottom => (ob.x + offset, ob.bottom()),
+            Side::Top => (ob.x + offset, ob.y - mover.h),
         };
-        let snap = ol.max(tl) as f32 * SNAP;
-        let candidates = [((ol - tl) / 2, None), (0, Some(0)), (ol - tl, Some(ol - tl))];
-        if let Some(&(_, offset)) = candidates.iter().find(|(at, _)| (start - *at as f32).abs() <= snap) {
-            return Some(Link { side, offset, proportional: false });
+        // Pin every device where it is now, so the layout is explicit.
+        for d in &world.devices {
+            shared.origins.insert(d.id.clone(), (d.origin.0.round() as i32, d.origin.1.round() as i32));
         }
-        let free = Link { side, offset: Some(start.round() as i32), proportional: false };
-        Some(Link { side, offset: Some(free.offset_for(ob, tb)), proportional: false })
+        shared.origins.insert(moving.to_owned(), (origin.0.round() as i32, origin.1.round() as i32));
+        shared
     }
 }
 
@@ -245,18 +203,24 @@ fn caption(frame: &mut Frame, over: Rectangle, label: &str, color: Color) {
     });
 }
 
-/// The stretch of our edge that touches the peer, in canvas pixels.
-fn shared_edge(side: Side, l: Rectangle, p: Rectangle) -> (Point, Point) {
-    match side {
-        Side::Right | Side::Left => {
-            let x = if side == Side::Right { l.x + l.width } else { l.x };
-            (Point::new(x, l.y.max(p.y)), Point::new(x, (l.y + l.height).min(p.y + p.height)))
-        }
-        Side::Bottom | Side::Top => {
-            let y = if side == Side::Bottom { l.y + l.height } else { l.y };
-            (Point::new(l.x.max(p.x), y), Point::new((l.x + l.width).min(p.x + p.width), y))
-        }
+/// Where two devices' bounds touch, as a canvas line.
+fn touching(a: Rectangle, b: Rectangle) -> Option<(Point, Point)> {
+    const EPS: f32 = 1.5;
+    let v = (a.y.max(b.y), (a.y + a.height).min(b.y + b.height));
+    let h = (a.x.max(b.x), (a.x + a.width).min(b.x + b.width));
+    if ((a.x + a.width) - b.x).abs() < EPS && v.1 > v.0 {
+        return Some((Point::new(b.x, v.0), Point::new(b.x, v.1)));
     }
+    if ((b.x + b.width) - a.x).abs() < EPS && v.1 > v.0 {
+        return Some((Point::new(a.x, v.0), Point::new(a.x, v.1)));
+    }
+    if ((a.y + a.height) - b.y).abs() < EPS && h.1 > h.0 {
+        return Some((Point::new(h.0, b.y), Point::new(h.1, b.y)));
+    }
+    if ((b.y + b.height) - a.y).abs() < EPS && h.1 > h.0 {
+        return Some((Point::new(h.0, a.y), Point::new(h.1, a.y)));
+    }
+    None
 }
 
 impl<M> canvas::Program<M> for Arrangement<'_, M> {
@@ -264,31 +228,26 @@ impl<M> canvas::Program<M> for Arrangement<'_, M> {
 
     fn update(&self, state: &mut State, event: &Event, bounds: Rectangle, cursor: mouse::Cursor) -> Option<Action<M>> {
         let on_change = self.on_change?;
-        let layout = self.layout(bounds.size());
-        let peer_bounds = layout.peer_bounds?;
+        let view = self.view(bounds.size());
         match event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 let at = cursor.position_in(bounds)?;
-                if layout.peer.iter().any(|r| r.contains(at)) {
-                    state.grab = Some(at - peer_bounds.position());
-                    state.drag_at = Some(peer_bounds.position());
-                    return Some(Action::request_redraw().and_capture());
-                }
-                None
+                let device = view.device_at(at).filter(|d| d.id != self.me)?;
+                let top_left = view.to_canvas(device.world_bounds()).position();
+                state.grab = Some((device.id.clone(), at - top_left));
+                state.drag_at = Some(top_left);
+                Some(Action::request_redraw().and_capture())
             }
             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
-                let grab = state.grab?;
-                let at = cursor.position_in(bounds).or_else(|| {
-                    cursor.position().map(|p| Point::new(p.x - bounds.x, p.y - bounds.y))
-                })?;
-                state.drag_at = Some(at - grab);
+                let (_, grab) = state.grab.as_ref()?;
+                let at = cursor.position_in(bounds).or_else(|| cursor.position().map(|p| Point::new(p.x - bounds.x, p.y - bounds.y)))?;
+                state.drag_at = Some(at - *grab);
                 Some(Action::request_redraw().and_capture())
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
-                state.grab.take()?;
+                let (id, _) = state.grab.take()?;
                 let top_left = state.drag_at.take()?;
-                let link = self.link_at(&layout, top_left)?;
-                Some(Action::publish(on_change(link)).and_capture())
+                Some(Action::publish(on_change(self.dropped(&view, &id, top_left))).and_capture())
             }
             _ => None,
         }
@@ -296,80 +255,74 @@ impl<M> canvas::Program<M> for Arrangement<'_, M> {
 
     fn draw(&self, state: &State, renderer: &Renderer, theme: &Theme, bounds: Rectangle, _cursor: mouse::Cursor) -> Vec<Geometry> {
         let palette = theme.extended_palette();
-        let layout = self.layout(bounds.size());
+        let view = self.view(bounds.size());
         let mut frame = Frame::new(renderer, bounds.size());
         let text = palette.background.base.text;
         let muted = palette.background.strong.color;
 
-        for (i, r) in layout.local.iter().enumerate() {
-            let label = match self.local.get(i) {
-                Some(s) => format!("{} × {}", s.w, s.h),
-                None => "Unknown".into(),
-            };
-            screen(&mut frame, *r, palette.primary.weak.color, palette.primary.strong.color, &label, palette.primary.weak.text);
-        }
-        caption(&mut frame, layout.local_bounds, self.local_label, text);
+        // While dragging: where it will land.
+        let target = match (&state.grab, state.drag_at) {
+            (Some((id, _)), Some(at)) => Some((id.clone(), self.world_for(&self.dropped(&view, id, at)))),
+            _ => None,
+        };
+        let shown = target.as_ref().map_or(&view.world, |(_, w)| w);
 
-        let Some(peer_bounds) = layout.peer_bounds else {
+        // Crossing lines between touching devices.
+        for (i, a) in shown.devices.iter().enumerate() {
+            for b in &shown.devices[i + 1..] {
+                if let Some((p, q)) = touching(view.to_canvas(a.world_bounds()), view.to_canvas(b.world_bounds())) {
+                    frame.stroke(&Path::line(p, q), Stroke::default().with_color(palette.success.base.color).with_width(4.0));
+                }
+            }
+        }
+        if let Some((id, world)) = &target
+            && let Some(d) = world.device(id)
+        {
+            let r = view.to_canvas(d.world_bounds());
+            let mut stroke = Stroke::default().with_color(palette.success.strong.color).with_width(2.0);
+            stroke.line_dash = LineDash { segments: &[8.0, 6.0], offset: 0 };
+            frame.stroke(&Path::rounded_rectangle(r.position(), r.size(), 6.0.into()), stroke);
+        }
+
+        for d in &view.world.devices {
+            let me = d.id == self.me;
+            let (fill, border, label_color) = if me {
+                (palette.primary.weak.color, palette.primary.strong.color, palette.primary.weak.text)
+            } else if self.connected.contains(&d.id) {
+                (palette.success.weak.color, palette.success.strong.color, palette.success.weak.text)
+            } else {
+                (palette.background.weak.color, muted, palette.background.weak.text)
+            };
+            // The dragged device follows the cursor.
+            let shift = match (&state.grab, state.drag_at) {
+                (Some((id, _)), Some(at)) if *id == d.id => at - view.to_canvas(d.world_bounds()).position(),
+                _ => Vector::ZERO,
+            };
+            let known = self.screens.get(&d.id).is_some_and(|v| !v.is_empty());
+            for (area, s) in d.areas().into_iter().zip(&d.screens) {
+                let label = if known { format!("{} × {}", s.w, s.h) } else { "Unknown".to_owned() };
+                screen(&mut frame, view.to_canvas(area) + shift, fill, border, &label, label_color);
+            }
+            let name = self.names.get(&d.id).cloned().unwrap_or_default();
+            let name = if !me && !self.connected.contains(&d.id) { format!("{name} · offline") } else { name };
+            caption(&mut frame, view.to_canvas(d.world_bounds()) + shift, &name, text);
+        }
+
+        if view.world.devices.len() < 2 {
+            let y = view.world.device(self.me).map_or(bounds.height / 2.0, |d| {
+                let r = view.to_canvas(d.world_bounds());
+                r.y + r.height + 22.0
+            });
             frame.fill_text(Text {
-                content: "Connect to your other device to arrange its screens.".into(),
-                position: Point::new(bounds.width / 2.0, layout.local_bounds.y + layout.local_bounds.height + 22.0),
+                content: "Pair a device to arrange its screens.".into(),
+                position: Point::new(bounds.width / 2.0, y),
                 color: muted,
                 size: 13.0.into(),
                 align_x: alignment::Horizontal::Center.into(),
                 align_y: alignment::Vertical::Top,
                 ..Text::default()
             });
-            return vec![frame.into_geometry()];
-        };
-
-        // While dragging, show where the screens will snap to.
-        let target = state.drag_at.and_then(|at| self.link_at(&layout, at)).unwrap_or(self.link);
-        let target_layout = target.proportional.then(|| self.layout_for(target, bounds.size()));
-        let target_rect = match &target_layout {
-            Some(l) => l.peer_bounds,
-            None => layout.peer_rect(target),
-        };
-        if state.drag_at.is_some()
-            && let Some(r) = target_rect
-        {
-            let path = Path::rounded_rectangle(r.position(), r.size(), 6.0.into());
-            let mut stroke = Stroke::default().with_color(palette.success.strong.color).with_width(2.0);
-            stroke.line_dash = LineDash { segments: &[8.0, 6.0], offset: 0 };
-            frame.stroke(&path, stroke);
         }
-
-        // The part of the edge the pointer crosses.
-        let edge = match &target_layout {
-            // Proportional: the whole outer edge of this device's row.
-            Some(l) => {
-                let outer = if target.side == Side::Left {
-                    l.local.iter().copied().min_by(|a, b| a.x.total_cmp(&b.x))
-                } else {
-                    l.local.iter().copied().max_by(|a, b| (a.x + a.width).total_cmp(&(b.x + b.width)))
-                };
-                outer.map(|r| {
-                    let x = if target.side == Side::Left { r.x } else { r.x + r.width };
-                    (Point::new(x, r.y), Point::new(x, r.y + r.height))
-                })
-            }
-            None => target_rect.map(|p| shared_edge(target.side, layout.local_bounds, p)),
-        };
-        if let Some((a, b)) = edge {
-            frame.stroke(&Path::line(a, b), Stroke::default().with_color(palette.success.base.color).with_width(4.0));
-        }
-
-        let shift = match state.drag_at {
-            Some(at) => at - peer_bounds.position(),
-            None => Vector::ZERO,
-        };
-        let peer = self.peer.unwrap_or_default();
-        for (i, r) in layout.peer.iter().enumerate() {
-            let label = peer.get(i).map(|s| format!("{} × {}", s.w, s.h)).unwrap_or_default();
-            screen(&mut frame, *r + shift, palette.success.weak.color, palette.success.strong.color, &label, palette.success.weak.text);
-        }
-        caption(&mut frame, peer_bounds + shift, self.peer_label, text);
-
         vec![frame.into_geometry()]
     }
 
@@ -380,9 +333,9 @@ impl<M> canvas::Program<M> for Arrangement<'_, M> {
         if state.grab.is_some() {
             return mouse::Interaction::Grabbing;
         }
-        let layout = self.layout(bounds.size());
-        match cursor.position_in(bounds) {
-            Some(at) if layout.peer.iter().any(|r| r.contains(at)) => mouse::Interaction::Grab,
+        let view = self.view(bounds.size());
+        match cursor.position_in(bounds).and_then(|at| view.device_at(at)) {
+            Some(d) if d.id != self.me => mouse::Interaction::Grab,
             _ => mouse::Interaction::default(),
         }
     }

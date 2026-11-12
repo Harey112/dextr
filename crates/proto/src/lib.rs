@@ -16,7 +16,7 @@ pub use keys::Key;
 use serde::{Deserialize, Serialize};
 
 /// Bumped on every incompatible change to [`Message`].
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 
 /// ALPN identifier negotiated on the QUIC connection.
 pub const ALPN: &[u8] = b"dextr/1";
@@ -112,11 +112,17 @@ pub enum Message {
     PairAccept,
     /// The sender's user declined or cancelled.
     PairReject,
-    /// Where the receiver sits next to the sender's screens: on `side` of
-    /// them, its edge starting `offset` pixels along theirs (`None`:
-    /// centered). `proportional` maps whole edge to whole edge instead. The
-    /// receiver mirrors it if `changed_at` (Unix ms) is newer than its own.
-    Arrangement { side: Side, offset: Option<i32>, proportional: bool, changed_at: u64 },
+    /// The shared arrangement of all devices' screens (by certificate
+    /// fingerprint). Receivers keep it if `changed_at` (Unix ms) is newer than
+    /// their own.
+    Layout {
+        proportional: bool,
+        /// Exact: each device's top-left in the shared space.
+        origins: Vec<([u8; 32], i32, i32)>,
+        /// Proportional: devices left to right.
+        row: Vec<[u8; 32]>,
+        changed_at: u64,
+    },
 }
 
 /// Clipboard contents, sent on a unidirectional stream of its own (it can

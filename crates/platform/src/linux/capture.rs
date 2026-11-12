@@ -20,14 +20,14 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::{CaptureCommand, CaptureEvent, Captured};
 
 pub(crate) fn spawn_capture(
-    side: Side,
+    sides: Vec<Side>,
     commands: mpsc::UnboundedReceiver<CaptureCommand>,
     events: mpsc::UnboundedSender<CaptureEvent>,
     screens: watch::Sender<Vec<Rect>>,
     ready: oneshot::Sender<anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
     crate::spawn_backend_thread("dextr-capture", move || async move {
-        let reason = match run(side, commands, &events, screens, ready).await {
+        let reason = match run(sides, commands, &events, screens, ready).await {
             Ok(()) => "capture closed".to_string(),
             Err(e) => format!("{e:#}"),
         };
@@ -55,12 +55,14 @@ impl Portal<'_> {
         Ok((rects, zones.zone_set()))
     }
 
-    /// Puts one barrier along the outer edge of every screen facing the peer.
-    async fn set_barriers(&self, side: Side, screens: &[Rect], zone_set: u32) -> anyhow::Result<()> {
-        let barriers: Vec<Barrier> = Rect::on_outer_edge(screens, side)
+    /// Puts one barrier along the outer edge of every screen on each of
+    /// `sides` (the sides with another device past them).
+    async fn set_barriers(&self, sides: &[Side], screens: &[Rect], zone_set: u32) -> anyhow::Result<()> {
+        let barriers: Vec<Barrier> = sides
             .iter()
+            .flat_map(|&side| Rect::on_outer_edge(screens, side).into_iter().map(move |r| (side, r)))
             .enumerate()
-            .map(|(i, r)| {
+            .map(|(i, (side, r))| {
                 let (x, y, w, h) = (r.x, r.y, r.w as i32, r.h as i32);
                 // Per the portal spec, right/bottom barriers sit one past the
                 // last pixel; left/top ones on the first.
@@ -84,10 +86,10 @@ impl Portal<'_> {
         Ok(())
     }
 
-    async fn refresh(&self, side: Side, screens_tx: &watch::Sender<Vec<Rect>>) -> anyhow::Result<()> {
+    async fn refresh(&self, sides: &[Side], screens_tx: &watch::Sender<Vec<Rect>>) -> anyhow::Result<()> {
         let (screens, zone_set) = self.screens().await?;
-        tracing::info!(?screens, %side, "capture zones");
-        self.set_barriers(side, &screens, zone_set).await?;
+        tracing::info!(?screens, ?sides, "capture zones");
+        self.set_barriers(sides, &screens, zone_set).await?;
         screens_tx.send_replace(screens);
         Ok(())
     }
@@ -118,11 +120,11 @@ async fn rearm(
     portal: &Portal<'_>,
     proxy: &InputCapture,
     session: &Session<InputCapture>,
-    side: Side,
+    sides: &[Side],
     screens_tx: &watch::Sender<Vec<Rect>>,
     enabled: bool,
 ) -> anyhow::Result<()> {
-    portal.refresh(side, screens_tx).await?;
+    portal.refresh(sides, screens_tx).await?;
     if enabled {
         proxy.enable(session, EnableOptions::default()).await?;
     }
@@ -130,7 +132,7 @@ async fn rearm(
 }
 
 async fn run(
-    mut side: Side,
+    mut sides: Vec<Side>,
     mut commands: mpsc::UnboundedReceiver<CaptureCommand>,
     events: &mpsc::UnboundedSender<CaptureEvent>,
     screens_tx: watch::Sender<Vec<Rect>>,
@@ -156,7 +158,7 @@ async fn run(
         }
     };
     let portal = Portal { proxy: &proxy, session: &session };
-    if let Err(e) = portal.refresh(side, &screens_tx).await {
+    if let Err(e) = portal.refresh(&sides, &screens_tx).await {
         let _ = ready.send(Err(e));
         return Ok(());
     }
@@ -204,17 +206,17 @@ async fn run(
                         .set_cursor_position(Some((x as f64, y as f64)));
                     proxy.release(&session, options).await?;
                     if std::mem::take(&mut side_pending) {
-                        rearm(&portal, &proxy, &session, side, &screens_tx, enabled).await?;
+                        rearm(&portal, &proxy, &session, &sides, &screens_tx, enabled).await?;
                     }
                 }
-                Some(CaptureCommand::SetSide(new_side)) => {
-                    side = new_side;
+                Some(CaptureCommand::SetSides(new_sides)) => {
+                    sides = new_sides;
                     // New barriers reset the session, which would end an
                     // active capture: wait until it's released.
                     if active.is_some() {
                         side_pending = true;
                     } else {
-                        rearm(&portal, &proxy, &session, side, &screens_tx, enabled).await?;
+                        rearm(&portal, &proxy, &session, &sides, &screens_tx, enabled).await?;
                     }
                 }
             },
@@ -238,7 +240,7 @@ async fn run(
                 active = None;
                 let _ = events.send(CaptureEvent::Deactivated);
                 if std::mem::take(&mut side_pending) {
-                    rearm(&portal, &proxy, &session, side, &screens_tx, enabled).await?;
+                    rearm(&portal, &proxy, &session, &sides, &screens_tx, enabled).await?;
                 }
             }
             Some(_) = disabled.next() => {
@@ -246,12 +248,12 @@ async fn run(
                 // Re-arm it with fresh barriers if we were active.
                 tracing::info!("capture disabled by compositor");
                 if enabled {
-                    portal.refresh(side, &screens_tx).await?;
+                    portal.refresh(&sides, &screens_tx).await?;
                     proxy.enable(&session, EnableOptions::default()).await?;
                 }
             }
             Some(_) = zones_changed.next() => {
-                portal.refresh(side, &screens_tx).await?;
+                portal.refresh(&sides, &screens_tx).await?;
             }
             event = ei_events.next() => match event {
                 None => break Err(anyhow::anyhow!("libei connection closed")),
