@@ -42,6 +42,12 @@ jobs:
           security import "$RUNNER_TEMP/cert.p12" -P "$MACOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
           security set-key-partition-list -S apple-tool:,apple: -k "$password" "$keychain" >/dev/null
           security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          # A self-signed certificate must be trusted for code signing.
+          openssl pkcs12 -in "$RUNNER_TEMP/cert.p12" -passin env:MACOS_CERTIFICATE_PASSWORD -clcerts -nokeys -out "$RUNNER_TEMP/cert.pem"
+          if [ "$(openssl x509 -in "$RUNNER_TEMP/cert.pem" -noout -subject)" = "$(openssl x509 -in "$RUNNER_TEMP/cert.pem" -noout -issuer | sed 's/^issuer/subject/')" ]; then
+            sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain "$RUNNER_TEMP/cert.pem"
+          fi
+          security find-identity -p codesigning "$keychain"
 
       - name: Build the DMG
         run: packaging/macos/build-dmg.sh

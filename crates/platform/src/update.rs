@@ -67,16 +67,18 @@ mod macos {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
-    /// The signing team of an app, if it has one (ad-hoc signatures don't).
-    fn team(app: &Path) -> Option<String> {
-        let out = Command::new("codesign").args(["-dv", "--verbose=2"]).arg(app).output().ok()?;
+    /// Who signed an app, as macOS's "designated requirement" (for example
+    /// `identifier "dev.dextr.dextr" and certificate leaf = H"…"`). None for
+    /// an ad-hoc signature, which names no signer.
+    fn requirement(app: &Path) -> Option<String> {
+        let info = Command::new("codesign").args(["-dv"]).arg(app).output().ok()?;
         // codesign prints its details on stderr.
-        String::from_utf8_lossy(&out.stderr)
-            .lines()
-            .find_map(|l| l.strip_prefix("TeamIdentifier="))
-            .map(str::trim)
-            .filter(|t| !t.is_empty() && *t != "not set")
-            .map(str::to_owned)
+        if String::from_utf8_lossy(&info.stderr).contains("Signature=adhoc") {
+            return None;
+        }
+        let out = Command::new("codesign").args(["-d", "--requirements", "-"]).arg(app).output().ok()?;
+        let text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+        text.lines().find_map(|l| l.strip_prefix("designated => ")).map(|r| r.trim().to_owned())
     }
 
     struct Mount(PathBuf);
@@ -102,12 +104,12 @@ mod macos {
             .find(|p| p.extension().is_some_and(|e| e == "app"))
             .context("the update has no app in it")?;
 
-        // Same signer as this copy, and an intact signature.
+        // An intact signature, from whoever signed this copy (an ad-hoc
+        // copy names no signer, so there's nothing to compare with).
         run(Command::new("codesign").args(["--verify", "--deep", "--strict"]).arg(&new)).context("the update's signature is invalid")?;
-        if let Some(ours) = team(&current)
-            && team(&new).as_deref() != Some(ours.as_str())
-        {
-            bail!("the update isn't signed by the same developer as this copy");
+        if let Some(ours) = requirement(&current) {
+            run(Command::new("codesign").args(["--verify", "--deep", "--strict"]).arg(format!("-R={ours}")).arg(&new))
+                .context("the update isn't signed by the same developer as this copy")?;
         }
 
         // Copy next to the current app, then swap: the running program keeps

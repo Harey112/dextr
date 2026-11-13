@@ -29,8 +29,9 @@ const DEXTR_EVENT: i64 = 0x6465_7874; // "dext"
 const SCREEN_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 
 const PERMISSION_HINT: &str = "Allow it under System Settings → Privacy & Security → Accessibility \
-(and Input Monitoring), for dextr or for the terminal app that starts it. Then press \"Ask again\" \
-or restart dextr.";
+(and Input Monitoring), for dextr or for the terminal app that starts it, then quit and reopen dextr. \
+If dextr is already switched on there, remove it with − and allow it again: the entry can be left \
+over from another version.";
 
 /// The active displays, in global points.
 fn screens() -> Vec<Rect> {

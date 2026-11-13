@@ -190,7 +190,10 @@ publishing. To build it on a Mac yourself:
 packaging/macos/build-dmg.sh        # writes dist/dextr-<version>-macos.dmg
 ```
 
-Without signing secrets the app is signed ad hoc. To sign and notarize, add these repository secrets
-(Apple Developer account needed): `MACOS_CERTIFICATE` (the Developer ID Application certificate as
+Releases are signed with a self-signed certificate (secrets `MACOS_CERTIFICATE`,
+`MACOS_CERTIFICATE_PASSWORD` and `SIGN_IDENTITY`), so macOS keeps dextr's permissions across updates and
+the updater accepts only updates signed with the same certificate. Without these secrets the app is
+signed ad hoc, and macOS asks for the permissions again after every update. To also notarize (no
+Gatekeeper warning), use a Developer ID instead (Apple Developer account needed): `MACOS_CERTIFICATE` (the Developer ID Application certificate as
 a base64 `.p12`), `MACOS_CERTIFICATE_PASSWORD`, `SIGN_IDENTITY` (e.g. `Developer ID Application: Name
 (TEAMID)`), `APPLE_ID`, `APPLE_TEAM_ID` and `APPLE_APP_PASSWORD` (an app-specific password).
