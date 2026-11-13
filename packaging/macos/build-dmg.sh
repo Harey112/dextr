@@ -24,7 +24,7 @@ export MACOSX_DEPLOYMENT_TARGET=11.0
 targets=(aarch64-apple-darwin x86_64-apple-darwin)
 rustup target add "${targets[@]}" >/dev/null
 for t in "${targets[@]}"; do
-    echo "Building $t…"
+    echo "Building ${t}…"
     cargo build --release --locked -p dextr-app --target "$t"
 done
 
@@ -39,7 +39,7 @@ cp assets/dextr.icns "$app/Contents/Resources/dextr.icns"
 printf 'APPL????' > "$app/Contents/PkgInfo"
 
 if [ -n "${SIGN_IDENTITY:-}" ]; then
-    echo "Signing with $SIGN_IDENTITY…"
+    echo "Signing with ${SIGN_IDENTITY}…"
     codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$app"
 else
     echo "No SIGN_IDENTITY: signing ad hoc."
