@@ -52,7 +52,16 @@ On first start the desktop asks twice: once to allow remote input, once to allow
 
 ### macOS
 
-Needs macOS 11 or newer, the Xcode command line tools and Rust:
+**Download:** get `dextr-<version>-macos.dmg` from
+[Releases](https://github.com/Harey112/dextr/releases), open it and drag **dextr** to
+**Applications**. It runs on Apple Silicon and Intel Macs with macOS 11 or newer.
+
+If the release isn't notarized yet, macOS says it can't check dextr for malware. Right-click (or
+Control-click) dextr in Applications, choose **Open**, then **Open** again. On macOS 15 and newer,
+go to **System Settings → Privacy & Security** after the first try instead, and press **Open
+Anyway**.
+
+**From source:** needs the Xcode command line tools and Rust:
 
 ```sh
 xcode-select --install                                          # if not installed yet
@@ -68,9 +77,11 @@ macOS then asks for two permissions. Allow them in **System Settings → Privacy
   take over the mouse and keyboard when this Mac controls the other device.
 * **Input Monitoring**: to read the mouse and keyboard while controlling the other device.
 
-When dextr is started from a terminal, macOS asks for these for the **terminal app** (Terminal,
+The installed app asks for them as **dextr**. When dextr is started from a terminal, macOS asks for
+these for the **terminal app** (Terminal,
 iTerm, …), so that is the entry to switch on. Afterwards press **Ask again** on the Overview page, or
-quit and restart dextr. If macOS asks whether dextr may accept incoming network connections, allow it.
+quit and restart dextr. If macOS asks whether dextr may accept incoming network connections, or
+find devices on your local network, allow it.
 
 ## Pair devices
 
@@ -154,3 +165,18 @@ The controlling side keeps a virtual pointer in the peer's coordinates and sends
 motion as unreliable QUIC datagrams (a lost one is replaced by the next), and clicks, keys and scrolling
 on a reliable stream. Clicks carry the pointer position, so they land correctly even if motion was dropped.
 Keys travel as USB HID usages, so the receiving computer applies its own keyboard layout.
+
+## Making a release
+
+Push a version tag (the version in `Cargo.toml`, e.g. `v0.1.0`) and GitHub Actions builds the macOS
+DMG and publishes it on the Releases page. **Run workflow** on the Actions tab builds it without
+publishing. To build it on a Mac yourself:
+
+```sh
+packaging/macos/build-dmg.sh        # writes dist/dextr-<version>-macos.dmg
+```
+
+Without signing secrets the app is signed ad hoc. To sign and notarize, add these repository secrets
+(Apple Developer account needed): `MACOS_CERTIFICATE` (the Developer ID Application certificate as
+a base64 `.p12`), `MACOS_CERTIFICATE_PASSWORD`, `SIGN_IDENTITY` (e.g. `Developer ID Application: Name
+(TEAMID)`), `APPLE_ID`, `APPLE_TEAM_ID` and `APPLE_APP_PASSWORD` (an app-specific password).
