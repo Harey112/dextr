@@ -2,6 +2,7 @@
 //! window (the Linux launcher and taskbar, the macOS Dock).
 
 /// The desktop app ID: the Wayland app ID, the .desktop file and icon name.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub const APP_ID: &str = "dev.dextr.dextr";
 
 const PNG_256: &[u8] = include_bytes!("../../../assets/icons/dextr-256.png");
