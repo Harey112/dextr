@@ -35,3 +35,4 @@ iced = { version = "0.14", features = ["tokio", "canvas"] }
 [profile.release]
 lto = "thin"
 codegen-units = 1
+strip = true

@@ -33,7 +33,7 @@ cp assets/icons/dextr-*.png "$stage/$name/icons/"
 tar -C "$stage" -czf "$dist/$name.tar.gz" "$name"
 
 # Debian/Ubuntu and Fedora/openSUSE packages.
-cargo deb -p dextr-app --no-build --target "$target" -o "$dist/"
+cargo deb -p dextr-app --no-build --no-strip --target "$target" -o "$dist/"
 cargo generate-rpm -p crates/app --target "$target" -o "$dist/"
 
 # AppImage (x86_64 only for now).
