@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=dextr
+GenericName=Mouse and keyboard sharing
+Comment=Share one mouse, keyboard and clipboard between computers
+Exec=dextr
+Icon=dev.dextr.dextr
+Terminal=false
+Categories=Utility;
+Keywords=mouse;keyboard;clipboard;share;kvm;
+StartupWMClass=dev.dextr.dextr

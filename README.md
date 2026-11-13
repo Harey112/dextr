@@ -44,6 +44,20 @@ so the taskbar and app menu show it. On macOS it sets its Dock icon itself.
 
 ### Linux
 
+Download from [Releases](https://github.com/Harey112/dextr/releases) (x86_64 and ARM64):
+
+| Distro | File | Install |
+|---|---|---|
+| Ubuntu, Debian, Mint, Pop!_OS | `dextr_<version>-1_amd64.deb` | `sudo apt install ./dextr_*.deb` |
+| Fedora, openSUSE, RHEL | `dextr-<version>-1.x86_64.rpm` | `sudo dnf install ./dextr-*.rpm` (openSUSE: `sudo zypper install`) |
+| Any other | `dextr-<version>-x86_64.AppImage` | `chmod +x dextr-*.AppImage` and run it |
+| Any other | `dextr-<version>-linux-x86_64.tar.gz` | Unpack and run `./dextr` |
+
+It works on Ubuntu 20.04, Debian 11, Fedora 32 and newer. Mouse and keyboard sharing needs a Wayland
+desktop with the InputCapture portal: KDE Plasma 6.1+ or GNOME 45+.
+
+**From source:**
+
 ```sh
 cargo run --release
 ```
@@ -168,8 +182,8 @@ Keys travel as USB HID usages, so the receiving computer applies its own keyboar
 
 ## Making a release
 
-Push a version tag (the version in `Cargo.toml`, e.g. `v0.1.0`) and GitHub Actions builds the macOS
-DMG and publishes it on the Releases page. **Run workflow** on the Actions tab builds it without
+Bump `version` in `Cargo.toml`, then push a matching tag (e.g. `v0.1.1`): GitHub Actions builds the
+macOS DMG and the Linux packages (`packaging/linux/build.sh`) and publishes them on the Releases page. **Run workflow** on the Actions tab builds it without
 publishing. To build it on a Mac yourself:
 
 ```sh

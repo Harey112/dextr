@@ -1,6 +1,6 @@
 [package]
 name = "dextr-app"
-description = "dextr desktop app (iced)"
+description = "Share one mouse, keyboard and clipboard between computers"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -22,3 +22,50 @@ serde.workspace = true
 anyhow.workspace = true
 ureq = { version = "3", features = ["json"] }
 
+[package.metadata.deb]
+name = "dextr"
+maintainer = "dextr developers <https://github.com/Harey112/dextr>"
+copyright = "dextr contributors"
+license-file = ["../../LICENSE", "0"]
+extended-description = "Move the pointer off the edge of one screen onto the next computer, type there with the same keyboard, and copy and paste between them. Works between Linux and macOS over an encrypted connection."
+section = "utils"
+priority = "optional"
+depends = "libc6 (>= 2.31), libxkbcommon0, libwayland-client0"
+recommends = "libegl1, libvulkan1"
+assets = [
+    ["target/release/dextr", "usr/bin/dextr", "755"],
+    ["../../packaging/linux/dev.dextr.dextr.desktop", "usr/share/applications/dev.dextr.dextr.desktop", "644"],
+    ["../../packaging/linux/dev.dextr.dextr.metainfo.xml", "usr/share/metainfo/dev.dextr.dextr.metainfo.xml", "644"],
+    ["../../assets/icons/dextr-16.png", "usr/share/icons/hicolor/16x16/apps/dev.dextr.dextr.png", "644"],
+    ["../../assets/icons/dextr-24.png", "usr/share/icons/hicolor/24x24/apps/dev.dextr.dextr.png", "644"],
+    ["../../assets/icons/dextr-32.png", "usr/share/icons/hicolor/32x32/apps/dev.dextr.dextr.png", "644"],
+    ["../../assets/icons/dextr-48.png", "usr/share/icons/hicolor/48x48/apps/dev.dextr.dextr.png", "644"],
+    ["../../assets/icons/dextr-64.png", "usr/share/icons/hicolor/64x64/apps/dev.dextr.dextr.png", "644"],
+    ["../../assets/icons/dextr-128.png", "usr/share/icons/hicolor/128x128/apps/dev.dextr.dextr.png", "644"],
+    ["../../assets/icons/dextr-256.png", "usr/share/icons/hicolor/256x256/apps/dev.dextr.dextr.png", "644"],
+    ["../../assets/icons/dextr-512.png", "usr/share/icons/hicolor/512x512/apps/dev.dextr.dextr.png", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "dextr"
+summary = "Share one mouse, keyboard and clipboard between computers"
+url = "https://github.com/Harey112/dextr"
+auto-req = "no"
+assets = [
+    { source = "target/release/dextr", dest = "/usr/bin/dextr", mode = "755" },
+    { source = "../../packaging/linux/dev.dextr.dextr.desktop", dest = "/usr/share/applications/dev.dextr.dextr.desktop", mode = "644" },
+    { source = "../../packaging/linux/dev.dextr.dextr.metainfo.xml", dest = "/usr/share/metainfo/dev.dextr.dextr.metainfo.xml", mode = "644" },
+    { source = "../../LICENSE", dest = "/usr/share/licenses/dextr/LICENSE", mode = "644", doc = true },
+    { source = "../../assets/icons/dextr-16.png", dest = "/usr/share/icons/hicolor/16x16/apps/dev.dextr.dextr.png", mode = "644" },
+    { source = "../../assets/icons/dextr-24.png", dest = "/usr/share/icons/hicolor/24x24/apps/dev.dextr.dextr.png", mode = "644" },
+    { source = "../../assets/icons/dextr-32.png", dest = "/usr/share/icons/hicolor/32x32/apps/dev.dextr.dextr.png", mode = "644" },
+    { source = "../../assets/icons/dextr-48.png", dest = "/usr/share/icons/hicolor/48x48/apps/dev.dextr.dextr.png", mode = "644" },
+    { source = "../../assets/icons/dextr-64.png", dest = "/usr/share/icons/hicolor/64x64/apps/dev.dextr.dextr.png", mode = "644" },
+    { source = "../../assets/icons/dextr-128.png", dest = "/usr/share/icons/hicolor/128x128/apps/dev.dextr.dextr.png", mode = "644" },
+    { source = "../../assets/icons/dextr-256.png", dest = "/usr/share/icons/hicolor/256x256/apps/dev.dextr.dextr.png", mode = "644" },
+    { source = "../../assets/icons/dextr-512.png", dest = "/usr/share/icons/hicolor/512x512/apps/dev.dextr.dextr.png", mode = "644" },
+]
+
+[package.metadata.generate-rpm.requires]
+"libxkbcommon.so.0()(64bit)" = "*"
+"libwayland-client.so.0()(64bit)" = "*"

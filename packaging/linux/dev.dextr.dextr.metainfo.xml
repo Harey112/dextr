@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>dev.dextr.dextr</id>
+  <name>dextr</name>
+  <summary>Share one mouse, keyboard and clipboard between computers</summary>
+  <developer id="io.github.harey112">
+    <name>Harey112</name>
+  </developer>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <launchable type="desktop-id">dev.dextr.dextr.desktop</launchable>
+  <url type="homepage">https://github.com/Harey112/dextr</url>
+  <url type="bugtracker">https://github.com/Harey112/dextr/issues</url>
+  <description>
+    <p>
+      Move the pointer off the edge of one screen and onto the next computer, and type there with the
+      same keyboard. Copy on one computer and paste on another. Works between Linux and macOS, with any
+      number of devices, over an encrypted connection.
+    </p>
+  </description>
+  <categories>
+    <category>Utility</category>
+  </categories>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.1" date="2026-11-13"/>
+    <release version="0.1.0" date="2026-11-13"/>
+  </releases>
+</component>

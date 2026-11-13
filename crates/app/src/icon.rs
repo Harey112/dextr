@@ -7,6 +7,15 @@ pub const APP_ID: &str = "dev.dextr.dextr";
 
 const PNG_256: &[u8] = include_bytes!("../../../assets/icons/dextr-256.png");
 
+/// The program to start dextr with: the AppImage file when running from
+/// one (the binary itself is in a temporary mount), else this binary.
+pub fn launcher() -> std::io::Result<std::path::PathBuf> {
+    match std::env::var_os("APPIMAGE") {
+        Some(path) if cfg!(target_os = "linux") => Ok(path.into()),
+        _ => std::env::current_exe(),
+    }
+}
+
 /// The icon for dextr's window.
 pub fn window_icon() -> Option<iced::window::Icon> {
     let image = image::load_from_memory_with_format(PNG_256, image::ImageFormat::Png).ok()?.into_rgba8();
@@ -38,7 +47,11 @@ pub fn install_desktop_entry() {
     else {
         return;
     };
-    let Ok(exe) = std::env::current_exe() else { return };
+    let Ok(exe) = launcher() else { return };
+    // Installed by a package: it brings its own entry and icons.
+    if exe.starts_with("/usr") || exe.starts_with("/opt") || std::env::var_os("FLATPAK_ID").is_some() {
+        return;
+    }
 
     // Write only what differs, so this costs nothing on later starts.
     let write = |path: PathBuf, bytes: &[u8]| -> std::io::Result<bool> {
