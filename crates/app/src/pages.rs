@@ -11,7 +11,7 @@ use iced::{
     },
 };
 
-use crate::{Access, App, Danger, Message, Page, PeerChange, Setting, arrangement::Arrangement, autostart, os_name};
+use crate::{Access, App, Danger, Message, Page, PeerChange, Setting, Update, arrangement::Arrangement, autostart, os_name, update};
 
 // ── Type and icons ───────────────────────────────────────────────────────
 
@@ -603,13 +603,40 @@ fn overview(app: &App) -> Element<'_, Message> {
         .spacing(10),
     );
 
-    column![
-        heading(ic::OVERVIEW, "Overview", "One mouse, keyboard and clipboard across your computers.", None),
-        connection,
-        arrangement,
-        permissions_card(app),
-    ]
-    .spacing(18)
+    let mut page = column![heading(ic::OVERVIEW, "Overview", "One mouse, keyboard and clipboard across your computers.", None)].spacing(18);
+    if let Update::Available(release) | Update::Installing(release) = &app.update {
+        page = page.push(update_banner(app, release));
+    }
+    page.push(connection).push(arrangement).push(permissions_card(app)).into()
+}
+
+/// What "update" does here: install in place, or open the release page.
+fn update_button<'a>(app: &App, release: &update::Release) -> Element<'a, Message> {
+    if matches!(app.update, Update::Installing(_)) {
+        return button(text("Installing…")).style(button::primary).into();
+    }
+    if update::can_install(release) {
+        button(with_icon(ic::ROCKET, "Install and restart")).style(button::primary).on_press(Message::InstallUpdate).into()
+    } else {
+        button(with_icon(ic::ROCKET, "Get it")).style(button::primary).on_press(Message::OpenUrl(release.page.clone())).into()
+    }
+}
+
+fn update_banner<'a>(app: &App, release: &update::Release) -> Element<'a, Message> {
+    banner(
+        row![
+            column![
+                text(format!("dextr {} is available", release.version)).size(14).font(MEDIUM),
+                text("Update your other devices too: different versions may not connect.").size(12),
+            ]
+            .spacing(2)
+            .width(Length::Fill),
+            update_button(app, release),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center),
+        Tone::Active,
+    )
     .into()
 }
 
@@ -1209,14 +1236,34 @@ fn settings(app: &App) -> Element<'_, Message> {
         ]),
     );
 
+    let status: String = match &app.update {
+        Update::Unknown => "Not checked yet.".into(),
+        Update::Checking => "Checking…".into(),
+        Update::UpToDate => "Up to date.".into(),
+        Update::Available(r) => format!("dextr {} is available.", r.version),
+        Update::Installing(r) => format!("Installing dextr {}…", r.version),
+        Update::Failed(e) => format!("Couldn't check: {e}"),
+    };
+    let action: Element<'_, Message> = match &app.update {
+        Update::Available(r) | Update::Installing(r) => update_button(app, r),
+        Update::Checking => button(with_icon(ic::REFRESH, "Check now")).style(button::secondary).into(),
+        _ => icon_button(ic::REFRESH, "Check now", Message::CheckUpdates { manual: true }).into(),
+    };
     let about = card(
         ic::INFO,
-        "About",
+        "About and updates",
         column![
-            text(format!("dextr {}", env!("CARGO_PKG_VERSION"))).size(14).font(MEDIUM),
-            muted("One mouse, keyboard and clipboard across your computers. Closing the window keeps dextr in the tray."),
+            row![
+                column![text(format!("dextr {}", update::current())).size(14).font(MEDIUM), muted(status).size(12)]
+                    .spacing(2)
+                    .width(Length::Fill),
+                action,
+            ]
+            .spacing(12)
+            .align_y(Alignment::Center),
+            switch("Check for updates automatically", "", c.check_updates, Setting::CheckUpdates),
         ]
-        .spacing(6),
+        .spacing(14),
     );
 
     column![

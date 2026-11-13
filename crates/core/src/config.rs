@@ -80,6 +80,8 @@ pub struct Config {
     pub keyboard: KeyboardSettings,
     pub clipboard: ClipboardSettings,
     pub appearance: Appearance,
+    /// Look for a newer version once a day.
+    pub check_updates: bool,
 
     // Single-peer settings from earlier versions, read once and moved into
     // `peers` and `arrangement`.
@@ -120,6 +122,7 @@ impl Default for Config {
             keyboard: KeyboardSettings::default(),
             clipboard: ClipboardSettings::default(),
             appearance: Appearance::default(),
+            check_updates: true,
             peer_address: String::new(),
             peer_fingerprint: String::new(),
             peer_side: None,

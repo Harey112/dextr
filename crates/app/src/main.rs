@@ -7,10 +7,12 @@ mod arrangement;
 mod autostart;
 mod icon;
 mod pages;
+mod update;
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{Mutex, OnceLock},
+    time::Duration,
 };
 
 use dextr_core::{
@@ -188,6 +190,19 @@ pub struct App {
     tray_state: TrayState,
     /// Told the user once that closing the window keeps dextr in the tray.
     told_about_tray: bool,
+    pub update: Update,
+}
+
+/// Where the update check stands.
+#[derive(Debug, Clone, Default)]
+pub enum Update {
+    #[default]
+    Unknown,
+    Checking,
+    UpToDate,
+    Available(update::Release),
+    Installing(update::Release),
+    Failed(String),
 }
 
 /// The editable copy of the settings.
@@ -241,6 +256,7 @@ pub enum Setting {
     AllowControl(bool),
     Appearance(Appearance),
     ClipboardEnabled(bool),
+    CheckUpdates(bool),
 }
 
 /// Per-device mouse, keyboard and clipboard choices.
@@ -306,6 +322,7 @@ impl Setting {
             Setting::AllowControl(v) => c.connection.allow_control = v,
             Setting::Appearance(v) => c.appearance = v,
             Setting::ClipboardEnabled(v) => c.clipboard.enabled = v,
+            Setting::CheckUpdates(v) => c.check_updates = v,
         }
     }
 }
@@ -341,6 +358,18 @@ pub enum Message {
     Arm(Danger),
     Confirm(Danger),
     Cancel,
+    /// Look for a newer version: `manual` from the button, otherwise the
+    /// daily check (which schedules the next one).
+    CheckUpdates { manual: bool },
+    UpdateChecked { manual: bool, result: Result<Option<update::Release>, String> },
+    InstallUpdate,
+    UpdateInstalled(Result<(), String>),
+    OpenUrl(String),
+}
+
+/// The daily update check.
+fn next_update_check() -> Task<Message> {
+    Task::future(tokio::time::sleep(Duration::from_secs(24 * 60 * 60))).map(|()| Message::CheckUpdates { manual: false })
 }
 
 /// Starts the engine and turns its events into UI messages.
@@ -360,7 +389,9 @@ impl App {
     fn boot(hidden: bool) -> (Self, Task<Message>) {
         let mut app = Self { launch_at_login: autostart::enabled(), ..Self::default() };
         let task = if hidden { Task::none() } else { app.open_main() };
-        (app, task)
+        // First update check shortly after start, then daily.
+        let check = Task::future(tokio::time::sleep(Duration::from_secs(20))).map(|()| Message::CheckUpdates { manual: false });
+        (app, Task::batch([task, check]))
     }
 
     /// Opens the main window, or brings it to the front.
@@ -632,6 +663,70 @@ impl App {
                 }
             }
             Message::DismissNotice => self.notice = None,
+            Message::CheckUpdates { manual } => {
+                if !manual && !self.config().check_updates {
+                    return next_update_check();
+                }
+                if matches!(self.update, Update::Checking | Update::Installing(_)) {
+                    return if manual { Task::none() } else { next_update_check() };
+                }
+                self.update = Update::Checking;
+                return Task::perform(update::check(), move |result| Message::UpdateChecked { manual, result });
+            }
+            Message::UpdateChecked { manual, result } => {
+                self.update = match result {
+                    Ok(Some(release)) => {
+                        if !matches!(self.update, Update::Available(ref r) if r.version == release.version) {
+                            self.push_log(format!("dextr {} is available.", release.version));
+                        }
+                        Update::Available(release)
+                    }
+                    Ok(None) => Update::UpToDate,
+                    Err(e) => {
+                        if manual {
+                            self.push_log(format!("Couldn't check for updates: {e}"));
+                        }
+                        Update::Failed(e)
+                    }
+                };
+                self.sync_tray();
+                if !manual {
+                    return next_update_check();
+                }
+            }
+            Message::InstallUpdate => {
+                let Update::Available(release) = self.update.clone() else { return Task::none() };
+                if !update::can_install(&release) {
+                    return self.update(Message::OpenUrl(release.page));
+                }
+                self.push_log(format!("Downloading dextr {}…", release.version));
+                self.update = Update::Installing(release.clone());
+                return Task::perform(update::install(release), Message::UpdateInstalled);
+            }
+            Message::UpdateInstalled(result) => match result {
+                Ok(()) => {
+                    self.push_log("Update installed: restarting.");
+                    return iced::exit();
+                }
+                Err(e) => {
+                    self.notify(format!("Couldn't install the update: {e}"));
+                    if let Update::Installing(release) = self.update.clone() {
+                        self.update = Update::Available(release);
+                    }
+                }
+            },
+            Message::OpenUrl(url) => {
+                let opener = if cfg!(target_os = "macos") {
+                    "open"
+                } else if cfg!(windows) {
+                    "explorer"
+                } else {
+                    "xdg-open"
+                };
+                if let Err(e) = std::process::Command::new(opener).arg(&url).spawn() {
+                    self.notify(format!("Cannot open {url}: {e}"));
+                }
+            }
             Message::LaunchAtLogin(on) => match autostart::set(on) {
                 Ok(()) => {
                     self.launch_at_login = on;
