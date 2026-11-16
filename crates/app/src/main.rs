@@ -198,6 +198,8 @@ pub struct App {
     /// Told the user once that closing the window keeps dextr in the tray.
     told_about_tray: bool,
     pub update: Update,
+    /// The desktop's light or dark preference, as last reported.
+    system_mode: iced::theme::Mode,
 }
 
 /// Where the update check stands.
@@ -372,6 +374,7 @@ pub enum Message {
     InstallUpdate,
     UpdateInstalled(Result<(), String>),
     OpenUrl(String),
+    SystemTheme(iced::theme::Mode),
 }
 
 /// The daily update check.
@@ -398,7 +401,8 @@ impl App {
         let task = if hidden { Task::none() } else { app.open_main() };
         // First update check shortly after start, then daily.
         let check = Task::future(tokio::time::sleep(Duration::from_secs(20))).map(|()| Message::CheckUpdates { manual: false });
-        (app, Task::batch([task, check]))
+        let theme = iced::system::theme().map(Message::SystemTheme);
+        (app, Task::batch([task, check, theme]))
     }
 
     /// Opens the main window, or brings it to the front.
@@ -467,7 +471,13 @@ impl App {
 
     fn theme(&self, _window: window::Id) -> Option<Theme> {
         match self.form.config.appearance {
-            Appearance::System => None,
+            // Resolved here rather than left to iced: it forgets the system
+            // theme when a window opens later (from the tray) on Wayland.
+            Appearance::System => match self.system_mode {
+                iced::theme::Mode::Dark => Some(Theme::Dark),
+                iced::theme::Mode::Light => Some(Theme::Light),
+                iced::theme::Mode::None => None,
+            },
             Appearance::Light => Some(Theme::Light),
             Appearance::Dark => Some(Theme::Dark),
         }
@@ -478,6 +488,7 @@ impl App {
             Subscription::run(engine_events),
             Subscription::run(tray_events),
             window::close_events().map(Message::WindowGone),
+            iced::system::theme_changes().map(Message::SystemTheme),
         ])
     }
 
@@ -670,6 +681,13 @@ impl App {
                 }
             }
             Message::DismissNotice => self.notice = None,
+            // A new window without a theme of its own reports "none": keep
+            // the last real preference.
+            Message::SystemTheme(mode) => {
+                if mode != iced::theme::Mode::None {
+                    self.system_mode = mode;
+                }
+            }
             Message::CheckUpdates { manual } => {
                 if !manual && !self.config().check_updates {
                     return next_update_check();
