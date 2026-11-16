@@ -1,7 +1,10 @@
 //! Checking GitHub Releases for a newer dextr, and installing it where the
-//! app can update itself (macOS). Elsewhere it links to the release.
+//! app can update itself (macOS; Linux .rpm, .deb and AppImage). Elsewhere
+//! it links to the release.
 
 use std::{io::Write as _, path::PathBuf, time::Duration};
+
+use sha2::{Digest as _, Sha256};
 
 use anyhow::{Context as _, bail};
 use serde::Deserialize;
@@ -19,8 +22,11 @@ pub fn current() -> &'static str {
 pub struct Release {
     pub version: String,
     pub page: String,
-    /// The file this OS installs from, if the release has one.
-    pub package: Option<String>,
+    /// The file this copy installs from, if the release has one: its name
+    /// and download link.
+    pub package: Option<(String, String)>,
+    /// Link to the release's SHA256SUMS.
+    pub checksums: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -78,19 +84,23 @@ fn latest_from(url: &str, current: &str) -> anyhow::Result<Option<Release>> {
     if !newer(&version, current) {
         return Ok(None);
     }
-    let suffix = if cfg!(target_os = "macos") { Some("-macos.dmg") } else { None };
-    let package = suffix.and_then(|s| release.assets.iter().find(|a| a.name.ends_with(s))).map(|a| a.browser_download_url.clone());
-    Ok(Some(Release { version, page: release.html_url, package }))
+    let package = dextr_platform::update::package_suffix()
+        .and_then(|s| release.assets.iter().find(|a| a.name.ends_with(&s)))
+        .map(|a| (a.name.clone(), a.browser_download_url.clone()));
+    let checksums = release.assets.iter().find(|a| a.name == "SHA256SUMS").map(|a| a.browser_download_url.clone());
+    Ok(Some(Release { version, page: release.html_url, package, checksums }))
 }
 
 pub async fn check() -> Result<Option<Release>, String> {
     tokio::task::spawn_blocking(latest).await.map_err(|e| e.to_string())?.map_err(|e| format!("{e:#}"))
 }
 
-fn download(url: &str) -> anyhow::Result<PathBuf> {
+/// Downloads `url` as `name`, checking it against the release's checksum
+/// list when there is one.
+fn download(name: &str, url: &str, checksums: Option<&str>) -> anyhow::Result<PathBuf> {
     let dir = dextr_platform::update::download_dir();
     std::fs::create_dir_all(&dir)?;
-    let path = dir.join("dextr-update.dmg");
+    let path = dir.join(name);
     let mut response = agent().get(url).call()?;
     if !response.status().is_success() {
         bail!("download failed: {}", response.status());
@@ -99,6 +109,26 @@ fn download(url: &str) -> anyhow::Result<PathBuf> {
     let mut file = std::fs::File::create(&path)?;
     std::io::copy(&mut reader, &mut file).context("downloading")?;
     file.flush()?;
+    drop(file);
+
+    if let Some(url) = checksums {
+        let mut response = agent().get(url).call()?;
+        if !response.status().is_success() {
+            bail!("couldn't get the checksums: {}", response.status());
+        }
+        let sums = response.body_mut().read_to_string()?;
+        let expected = sums
+            .lines()
+            .filter_map(|l| l.split_once(char::is_whitespace))
+            .find(|(_, file)| file.trim().trim_start_matches('*') == name)
+            .map(|(hash, _)| hash.to_ascii_lowercase())
+            .with_context(|| format!("{name} isn't in the release's checksums"))?;
+        let actual = hex::encode(Sha256::digest(std::fs::read(&path)?));
+        if actual != expected {
+            let _ = std::fs::remove_file(&path);
+            bail!("the download is damaged (checksum mismatch); try again");
+        }
+    }
     Ok(path)
 }
 
@@ -106,8 +136,8 @@ fn download(url: &str) -> anyhow::Result<PathBuf> {
 /// new version starts.
 pub async fn install(release: Release) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
-        let url = release.package.as_deref().context("this release has nothing to install here")?;
-        let path = download(url)?;
+        let (name, url) = release.package.as_ref().context("this release has nothing to install here")?;
+        let path = download(name, url, release.checksums.as_deref())?;
         dextr_platform::update::install(&path)
     })
     .await

@@ -48,8 +48,23 @@ pub fn install_desktop_entry() {
         return;
     };
     let Ok(exe) = launcher() else { return };
-    // Installed by a package: it brings its own entry and icons.
+    let entry_path = data.join(format!("applications/{APP_ID}.desktop"));
+    // Installed by a package: it brings its own entry and icons. An entry
+    // an earlier copy (from source, an AppImage) wrote for this user would
+    // hide it and start that other copy, so remove ours.
     if exe.starts_with("/usr") || exe.starts_with("/opt") || std::env::var_os("FLATPAK_ID").is_some() {
+        let ours = std::fs::read_to_string(&entry_path).is_ok_and(|e| e.contains("X-Dextr-Self-Installed") || e.contains("Exec=\""));
+        if ours {
+            let _ = std::fs::remove_file(&entry_path);
+            for (size, _) in ICONS {
+                let _ = std::fs::remove_file(data.join(format!("icons/hicolor/{size}x{size}/apps/{APP_ID}.png")));
+            }
+            refresh_desktop_database();
+        }
+        return;
+    }
+    // Development builds leave the user's launcher alone.
+    if cfg!(debug_assertions) {
         return;
     }
 
@@ -73,19 +88,24 @@ pub fn install_desktop_entry() {
     let entry = format!(
         "[Desktop Entry]\nType=Application\nName=dextr\nGenericName=Mouse and keyboard sharing\n\
          Comment=Share one mouse, keyboard and clipboard between computers\nExec=\"{}\"\nIcon={APP_ID}\n\
-         Terminal=false\nCategories=Utility;Network;\nStartupWMClass={APP_ID}\n",
+         Terminal=false\nCategories=Utility;\nStartupWMClass={APP_ID}\nX-Dextr-Self-Installed=true\n",
         exe.display()
     );
-    changed |= write(data.join(format!("applications/{APP_ID}.desktop")), entry.as_bytes()).unwrap_or(false);
+    changed |= write(entry_path, entry.as_bytes()).unwrap_or(false);
 
     if changed {
-        // Let the desktop pick up the new icon and entry.
-        for tool in ["kbuildsycoca6", "update-desktop-database"] {
-            let _ = std::process::Command::new(tool)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn();
-        }
+        refresh_desktop_database();
+    }
+}
+
+/// Lets the desktop pick up a changed entry and icon.
+#[cfg(target_os = "linux")]
+fn refresh_desktop_database() {
+    for tool in ["kbuildsycoca6", "update-desktop-database"] {
+        let _ = std::process::Command::new(tool)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
     }
 }
 

@@ -7,6 +7,7 @@ mod arrangement;
 mod autostart;
 mod icon;
 mod pages;
+mod single;
 mod update;
 
 use std::{
@@ -36,11 +37,17 @@ fn main() -> iced::Result {
         )
         .init();
 
-    #[cfg(target_os = "linux")]
-    icon::install_desktop_entry();
-
     // `--hidden` (used by launch at login): start in the tray, no window.
     let hidden = std::env::args().any(|a| a == "--hidden");
+
+    // Already running: that one shows its window instead.
+    if !single::claim(hidden) {
+        return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    icon::install_desktop_entry();
+    autostart::refresh();
 
     // A daemon, so dextr keeps running in the tray with its window closed.
     iced::daemon(move || App::boot(hidden), App::update, App::view)

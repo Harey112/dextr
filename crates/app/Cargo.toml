@@ -20,6 +20,8 @@ tokio.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }
 serde.workspace = true
 anyhow.workspace = true
+sha2.workspace = true
+hex.workspace = true
 ureq = { version = "3", features = ["json"] }
 
 [package.metadata.deb]

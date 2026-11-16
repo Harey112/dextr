@@ -90,3 +90,14 @@ pub fn set(on: bool) -> Result<(), String> {
         Err("launch at login isn't available on this OS yet".into())
     }
 }
+
+/// Keeps launch at login pointing at this copy (it may have been turned on
+/// by another one, e.g. before installing a package or updating).
+pub fn refresh() {
+    if cfg!(debug_assertions) || !enabled() {
+        return;
+    }
+    if let Err(e) = set(true) {
+        tracing::warn!("cannot update launch at login: {e}");
+    }
+}
