@@ -1,7 +1,8 @@
 //! Installing a downloaded update in place: on macOS the .app from a DMG;
 //! on Linux the .rpm or .deb through the system's package tools, or the
-//! AppImage file itself. Other installs (from source, the tarball) are
-//! updated by hand.
+//! AppImage file itself. A copy that came from none of these (built from
+//! source, the tarball) installs the system's package, or else puts dextr
+//! in ~/.local/bin.
 
 use std::path::{Path, PathBuf};
 
@@ -17,6 +18,19 @@ pub fn package_suffix() -> Option<String> {
         linux::kind().map(|k| k.suffix())
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
+}
+
+/// What installing an update does, when it's more than replacing this copy
+/// (e.g. installing dextr as a package for the first time).
+pub fn install_note() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::kind().and_then(|k| k.note())
+    }
+    #[cfg(not(target_os = "linux"))]
     {
         None
     }
@@ -99,15 +113,23 @@ mod linux {
 
     const INSTALLED: &str = "/usr/bin/dextr";
 
-    /// How this copy was installed.
+    /// How this copy is installed, or will be by the next update.
     pub enum Kind {
         AppImage(PathBuf),
-        Rpm,
-        Deb,
+        /// The .rpm; `installed` is false when this copy came from elsewhere
+        /// (source, the tarball) and the update installs the package.
+        Rpm { installed: bool },
+        Deb { installed: bool },
+        /// No package manager we know: the binary in ~/.local/bin.
+        Local(PathBuf),
     }
 
     fn succeeds(cmd: &mut Command) -> bool {
         cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success())
+    }
+
+    fn has(tool: &str) -> bool {
+        ["/usr/bin", "/bin", "/usr/sbin"].iter().any(|d| Path::new(d).join(tool).exists())
     }
 
     /// Worked out once: it can't change while running.
@@ -121,20 +143,23 @@ mod linux {
             return Some(Kind::AppImage(image.into()));
         }
         let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
-        if exe != Path::new(INSTALLED) {
-            return None;
+        if exe == Path::new(INSTALLED) {
+            if succeeds(Command::new("rpm").args(["-qf", INSTALLED])) {
+                return Some(Kind::Rpm { installed: true });
+            }
+            if succeeds(Command::new("dpkg").args(["-S", INSTALLED])) {
+                return Some(Kind::Deb { installed: true });
+            }
         }
-        if succeeds(Command::new("rpm").args(["-qf", INSTALLED])) {
-            Some(Kind::Rpm)
-        } else if succeeds(Command::new("dpkg").args(["-S", INSTALLED])) {
-            Some(Kind::Deb)
+        // Not from a package: install the one this system uses.
+        if has("apt-get") && has("dpkg") {
+            Some(Kind::Deb { installed: false })
+        } else if has("rpm") && (has("dnf") || has("zypper") || has("yum")) {
+            Some(Kind::Rpm { installed: false })
         } else {
-            None
+            let home = std::env::var_os("HOME")?;
+            Some(Kind::Local(PathBuf::from(home).join(".local/bin/dextr")))
         }
-    }
-
-    fn pkexec() -> bool {
-        ["/usr/bin/pkexec", "/bin/pkexec"].iter().any(|p| Path::new(p).exists())
     }
 
     impl Kind {
@@ -142,20 +167,44 @@ mod linux {
             let arch = std::env::consts::ARCH;
             match self {
                 Kind::AppImage(_) => format!("-{arch}.AppImage"),
-                Kind::Rpm => format!(".{arch}.rpm"),
-                Kind::Deb => format!("_{}.deb", if arch == "aarch64" { "arm64" } else { "amd64" }),
+                Kind::Rpm { .. } => format!(".{arch}.rpm"),
+                Kind::Deb { .. } => format!("_{}.deb", if arch == "aarch64" { "arm64" } else { "amd64" }),
+                Kind::Local(_) => format!("-linux-{arch}.tar.gz"),
             }
         }
 
         pub fn can_install(&self) -> bool {
             match self {
                 Kind::AppImage(path) => path.parent().is_some_and(super::writable),
-                Kind::Rpm | Kind::Deb => pkexec(),
+                Kind::Rpm { .. } | Kind::Deb { .. } => has("pkexec"),
+                Kind::Local(path) => path.parent().is_some_and(|d| std::fs::create_dir_all(d).is_ok() && super::writable(d)),
+            }
+        }
+
+        /// What installing does, when it isn't simply replacing this copy.
+        pub fn note(&self) -> Option<String> {
+            match self {
+                Kind::Rpm { installed: false } | Kind::Deb { installed: false } => {
+                    Some("Installs dextr as a system package (asks for your password); it then updates itself.".into())
+                }
+                Kind::Local(path) => Some(format!("Installs dextr in {}; it then updates itself.", path.display())),
+                _ => None,
             }
         }
     }
 
+    /// Runs a package tool as administrator (the desktop asks for the password).
+    fn as_admin(args: &[&str], package: &Path) -> anyhow::Result<()> {
+        let out = Command::new("pkexec").args(args).arg(package).output().context("running pkexec")?;
+        if !out.status.success() {
+            let why = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+            bail!("{}", if why.is_empty() { "installing was cancelled".to_owned() } else { why });
+        }
+        Ok(())
+    }
+
     pub fn install(package: &Path) -> anyhow::Result<()> {
+        let package = &package.canonicalize()?;
         match kind().context("this copy of dextr can't update itself")? {
             Kind::AppImage(image) => {
                 // Next to the old file, then swap: the running copy keeps
@@ -167,20 +216,44 @@ mod linux {
                 let _ = std::fs::remove_file(package);
                 super::start_after_exit("", image)
             }
-            kind => {
-                // The system asks for the administrator password.
-                let mut cmd = Command::new("pkexec");
-                match kind {
-                    Kind::Rpm => cmd.args(["rpm", "-U"]),
-                    _ => cmd.args(["dpkg", "-i"]),
-                };
-                let out = cmd.arg(package).output().context("running pkexec")?;
-                if !out.status.success() {
-                    let why = String::from_utf8_lossy(&out.stderr).trim().to_owned();
-                    bail!("{}", if why.is_empty() { "installing was cancelled".to_owned() } else { why });
+            Kind::Rpm { .. } => {
+                if has("dnf") {
+                    as_admin(&["dnf", "install", "-y"], package)?;
+                } else if has("zypper") {
+                    as_admin(&["zypper", "--non-interactive", "install", "--allow-unsigned-rpm"], package)?;
+                } else if has("yum") {
+                    as_admin(&["yum", "install", "-y"], package)?;
+                } else {
+                    as_admin(&["rpm", "-U"], package)?;
                 }
                 let _ = std::fs::remove_file(package);
                 super::start_after_exit("", Path::new(INSTALLED))
+            }
+            Kind::Deb { .. } => {
+                as_admin(&["apt-get", "install", "-y"], package)?;
+                let _ = std::fs::remove_file(package);
+                super::start_after_exit("", Path::new(INSTALLED))
+            }
+            Kind::Local(target) => {
+                let unpack = super::download_dir().join("unpacked");
+                let _ = std::fs::remove_dir_all(&unpack);
+                std::fs::create_dir_all(&unpack)?;
+                let out = Command::new("tar").arg("-xzf").arg(package).arg("-C").arg(&unpack).output().context("running tar")?;
+                if !out.status.success() {
+                    bail!("unpacking the update failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+                }
+                let binary = std::fs::read_dir(&unpack)?
+                    .filter_map(|e| e.ok().map(|e| e.path().join("dextr")))
+                    .find(|p| p.is_file())
+                    .context("the update has no dextr in it")?;
+                std::fs::create_dir_all(target.parent().context("no folder for dextr")?)?;
+                let staged = target.with_file_name(".dextr-update");
+                std::fs::copy(&binary, &staged).context("copying the update")?;
+                std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
+                std::fs::rename(&staged, target).context("putting dextr in place")?;
+                let _ = std::fs::remove_dir_all(&unpack);
+                let _ = std::fs::remove_file(package);
+                super::start_after_exit("", target)
             }
         }
     }
@@ -273,5 +346,14 @@ mod macos {
 
         // Start the new version once this one has quit.
         super::start_after_exit("open", &current)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    #[ignore = "depends on how this machine is set up"]
+    fn shows_how_this_copy_updates() {
+        println!("suffix={:?} can_install={} note={:?}", super::package_suffix(), super::can_install(), super::install_note());
     }
 }

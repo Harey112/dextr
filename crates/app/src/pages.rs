@@ -623,14 +623,20 @@ fn update_button<'a>(app: &App, release: &update::Release) -> Element<'a, Messag
 }
 
 fn update_banner<'a>(app: &App, release: &update::Release) -> Element<'a, Message> {
+    let mut info = column![
+        text(format!("dextr {} is available", release.version)).size(14).font(MEDIUM),
+        text("Update your other devices too: different versions may not connect.").size(12),
+    ]
+    .spacing(2)
+    .width(Length::Fill);
+    if update::can_install(release)
+        && let Some(note) = dextr_platform::update::install_note()
+    {
+        info = info.push(text(note).size(12));
+    }
     banner(
         row![
-            column![
-                text(format!("dextr {} is available", release.version)).size(14).font(MEDIUM),
-                text("Update your other devices too: different versions may not connect.").size(12),
-            ]
-            .spacing(2)
-            .width(Length::Fill),
+            info,
             update_button(app, release),
         ]
         .spacing(12)
@@ -1263,6 +1269,10 @@ fn settings(app: &App) -> Element<'_, Message> {
             .align_y(Alignment::Center),
             switch("Check for updates automatically", "", c.check_updates, Setting::CheckUpdates),
         ]
+        .push(match &app.update {
+            Update::Available(r) if update::can_install(r) => dextr_platform::update::install_note().map(|n| muted(n).size(12)),
+            _ => None,
+        })
         .spacing(14),
     );
 
