@@ -1011,8 +1011,7 @@ impl Engine {
                 let mut peers = self.config.peers.clone();
                 for (id, entry) in &mut peers {
                     if let Some(edited) = new.peers.get(id) {
-                        entry.send = edited.send;
-                        entry.receive = edited.receive;
+                        entry.take_choices(edited);
                     }
                 }
                 let token = self.config.inject_restore_token.take();

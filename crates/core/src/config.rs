@@ -37,6 +37,17 @@ pub struct PeerEntry {
 }
 
 impl PeerEntry {
+    /// Takes what the user chooses for this device from an edited copy:
+    /// its sharing switches and its mouse, keyboard and clipboard options.
+    /// What the engine learns about it (name, address, screens) stays.
+    pub fn take_choices(&mut self, edited: &PeerEntry) {
+        self.send = edited.send;
+        self.receive = edited.receive;
+        self.mouse = edited.mouse.clone();
+        self.keyboard = edited.keyboard.clone();
+        self.clipboard = edited.clipboard.clone();
+    }
+
     /// Whether `channel` is shared with this device in one direction: its
     /// switch and that direction's switch must both be on.
     pub fn allows(&self, channel: Channel, outgoing: bool) -> bool {
@@ -233,6 +244,22 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edited_choices_are_taken_but_learned_details_kept() {
+        use crate::settings::ModifierMap;
+        let mut kept = PeerEntry { name: "Mac".into(), address: "10.0.0.2".into(), ..PeerEntry::default() };
+        let mut edited = PeerEntry { name: "stale".into(), ..PeerEntry::default() };
+        edited.keyboard.modifiers = ModifierMap::AsIs;
+        edited.mouse.speed = 2.0;
+        edited.clipboard.on = false;
+        edited.send.keyboard = false;
+        kept.take_choices(&edited);
+        assert_eq!(kept.keyboard.modifiers, ModifierMap::AsIs);
+        assert_eq!(kept.mouse.speed, 2.0);
+        assert!(!kept.clipboard.on && !kept.send.keyboard);
+        assert_eq!((kept.name.as_str(), kept.address.as_str()), ("Mac", "10.0.0.2"));
+    }
 
     #[test]
     fn single_peer_config_moves_into_the_device_list() {
